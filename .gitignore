@@ -1,0 +1,29 @@
+# --- Secrets: NEVER commit these. This repo is public. ---
+.env
+.env.*
+!.env.example
+*api-key*.json
+*api_key*.json
+keys/
+secrets/
+
+# Runtime output
+logs/
+state/
+*.sqlite
+*.db
+reports/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
