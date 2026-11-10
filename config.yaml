@@ -1,0 +1,74 @@
+# TM-Trading-Bot configuration. Every value here can be overridden on the CLI.
+#
+# Scoring reminder (Orderbook Arena, Round 1: Nov 2 - Nov 30 2026 UTC):
+#   points = USD volume, maker fills x3, taker fills x1, "book of the day" x2 on top.
+#   Rules: no self-trading, wallets funded from the same address = one entrant,
+#   <= 30% of your volume with any single counterparty.
+
+# Books to quote. Only these 12 count for the competition.
+books:
+  - NVDAC
+  - TSLAC
+  - AAPLC
+  - MSFTC
+  - AMZNC
+  - GOOGLC
+  - METAC
+  - PLTRC
+  - MSTRC
+  - MUC
+  - SNDKC
+  - SPCXC
+
+# Set this every morning from the Discord announcement. Gets size_multiplier_daily_book.
+book_of_the_day: null
+
+quote_asset: USDC
+
+strategy:
+  # Target distance of our quotes from fair value, in basis points.
+  # The live books are ~50-100 bps wide, so 15-25 bps puts us at the top of the book
+  # while still earning edge when a taker hits us.
+  half_spread_bps: 20
+  # Never quote tighter than this to fair (protects against adverse selection).
+  min_edge_bps: 8
+  # Stay at least this many ticks behind the opposite best price, so our limit
+  # order cannot cross and become a taker (the API has no post-only flag).
+  no_cross_ticks: 1
+  # Shift both quotes against our inventory: at max inventory the quotes move
+  # by this many bps, so we sell what we hold more eagerly.
+  inventory_skew_bps: 25
+  # Only replace a resting quote if the new price differs by more than this.
+  requote_threshold_bps: 4
+  # Fair value = blend of the exchange reference price and the book mid.
+  # 1.0 = reference only, 0.0 = mid only.
+  reference_weight: 0.7
+  # Taking: hit a resting quote only if it is this far through fair value (pure mispricing).
+  take_enabled: false
+  take_edge_bps: 60
+
+sizing:
+  # USDC notional per quote. Exchange minimum notional is $1.
+  quote_notional_usd: 5.0
+  size_multiplier_daily_book: 2.0
+  # Max USDC worth of a single stock we will hold (long only, spot has no shorting).
+  max_position_usd: 12.0
+  # Max total USDC deployed in stock inventory across books.
+  max_gross_usd: 40.0
+
+risk:
+  # Stop the bot (cancel all) if marked-to-market PnL falls below this.
+  max_loss_usd: 5.0
+  # Do not quote when the book is wider than this (no reliable mid).
+  max_book_spread_bps: 250
+  # Do not quote when fair value and mid disagree by more than this.
+  max_fair_mid_gap_bps: 150
+  # Ignore market data older than this.
+  stale_data_secs: 120
+  # Hard cap on order create/modify/cancel calls per minute.
+  max_actions_per_minute: 40
+
+loop:
+  poll_secs: 3.0
+  # Reconcile live orders and fills against the exchange every N loops.
+  reconcile_every: 5
