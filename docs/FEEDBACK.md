@@ -94,6 +94,25 @@ Clients have to handle both. Converging on one would help, and so would always f
    side, which is probably one house liquidity provider. A participant who only takes
    liquidity could breach 30% without trying. Does the house MM count as a counterparty?
 
+## Onboarding / app UX
+
+- **Blocker: you can't create a passkey on an account that already has a wallet.** On
+  app.truemarkets.co/settings/api-keys, the banner says "Passkey required". At /setup-passkey,
+  "Set up passkey" fails with `User already has a wallet` (Chrome, macOS, 2026-11-10 ~04:20 UTC).
+  Without a passkey, API-key creation is disabled, so an existing user can't reach the Trading API.
+  The passkey flow seems to assume a brand-new wallet, when it should attach a passkey to the
+  existing one.
+
+- **API keys page, before a passkey exists:** "+ Create" and "+ Create API Key" look
+  clickable but do nothing on hover or click. The reason, a passkey being required, only
+  shows in the banner above. A disabled style with a tooltip ("Set up a passkey first"),
+  or having the button open passkey setup directly, would remove the confusion.
+- **Key types are easy to mix up:** keys from console.truemarkets.co are organization (Gateway)
+  keys (they download as `truemarkets-org-api-key-*.json`). When you
+  use one with the Trading API, the token is minted successfully, but `/balances` returns a bare
+  `401 unauthorized`. An error like "this is an organization key; personal trading keys are
+  created at app.truemarkets.co" would save new API users time.
+
 ## Market-structure observations (Sunday evening ET, US market closed)
 
 - Competition books are **40 to 100 bps wide**, with 1 to 3 orders per level.
