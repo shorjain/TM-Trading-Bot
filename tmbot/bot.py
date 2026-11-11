@@ -74,6 +74,10 @@ class Bot:
             return True
         except ApiError as e:
             self.log(f"  ! {what} failed: {e}")
+            if e.status in (401, 403):
+                # Retrying won't help (e.g. "trading is not available in this country").
+                self.log("!! account is not permitted to do this; stopping instead of retrying")
+                self.stop()
             return False
 
     # ---- reconcile one side of one book ----
@@ -141,6 +145,8 @@ class Bot:
             self.last_decisions[sym] = d
             want = {q.side: q for q in d.quotes}
             for side in ("buy", "sell"):
+                if not self.running:
+                    return
                 self._reconcile_side(sym, side, want.get(side))
 
     def status_line(self) -> str:

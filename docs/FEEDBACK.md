@@ -96,6 +96,13 @@ Clients have to handle both. Converging on one would help, and so would always f
 
 ## Onboarding / app UX
 
+- **Arena invites US participants, but US accounts can't trade the books.** My account
+  (`GET /assets/availability` → `{"country":"US","allowed_asset_classes":["crypto"]}`) can
+  onboard, receive the $50 Arena funding and create an API key, and only then hits
+  `403 permission_denied: trading is not available in this country` on the first stock order.
+  The check should happen at signup or Arena enrollment, or the Arena page should say up
+  front which countries can trade.
+
 - **Blocker: you can't create a passkey on an account that already has a wallet.** On
   app.truemarkets.co/settings/api-keys, the banner says "Passkey required". At /setup-passkey,
   "Set up passkey" fails with `User already has a wallet` (Chrome, macOS, 2026-11-10 ~04:20 UTC).
