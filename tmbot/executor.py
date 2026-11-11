@@ -134,14 +134,21 @@ class LiveExecutor:
     # -- balances (CeFi trading account) --
     def refresh_balances(self) -> None:
         bal: dict[str, Decimal] = {}
+        wallet_stable = D(0)
         for row in self.c.balances():
-            if row.get("venue") != "cefi":
-                continue
-            bal[row["symbol"]] = D(str(row.get("available") or 0))
+            avail = D(str(row.get("available") or 0))
+            if row.get("venue") == "cefi":
+                bal[row["symbol"]] = bal.get(row["symbol"], D(0)) + avail
+            elif row.get("stable") and row.get("symbol") in ("USDC", "PYUSD"):
+                # Stablecoins in the on-chain wallet. A CeFi buy without enough exchange
+                # balance comes back with a "funding bridge" to sign, which moves these
+                # onto the exchange, so they count as spendable.
+                wallet_stable += avail
         self._bal = bal
+        self._wallet_stable = wallet_stable
 
     def usd_available(self) -> Decimal:
-        return self._bal.get(self.quote_asset, D(0))
+        return self._bal.get(self.quote_asset, D(0)) + getattr(self, "_wallet_stable", D(0))
 
     def holding(self, book: str) -> Decimal:
         return self._bal.get(book, D(0))
