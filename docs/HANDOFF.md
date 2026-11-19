@@ -1,5 +1,9 @@
 # Handoff: paste everything below into a new Claude chat
 
+> Updated 2026-11-20: the bot now sizes as % of equity, has an instance lock, `--until` and
+> `--continuous`, and persisted loss limits. The README's "Windows (PowerShell) commands" section is the
+> current reference; it takes precedence over the older commands below.
+
 ---
 
 I'm continuing a project from Claude Code on my Mac. I'm now on a **Windows PC** with no
@@ -60,9 +64,9 @@ It only spends USDC already on the exchange.
    ```
 4. Test (read-only): `.venv\Scripts\python -m tmbot status`
 5. Windows Settings → System → Power → Sleep: **Never** (while plugged in).
-6. Run: `.venv\Scripts\python -m tmbot run --live --books NVDAC,AAPLC,PLTRC,TSLAC,METAC,AMZNC --minutes 210`
-   (adjust minutes so it ends before 4pm ET; add `--book-of-day XXX` from Discord). It asks
-   you to type `I UNDERSTAND THIS USES REAL MONEY`.
+6. Run: `.venv\Scripts\python -m tmbot run --live --book-of-day XXX --until 15:55`
+   (`XXX` = today's book from Discord; `--until HH:MM` is US-Eastern). It asks you to type
+   `I UNDERSTAND THIS USES REAL MONEY`.
 
 ## Commands (Windows)
 | Command | What |

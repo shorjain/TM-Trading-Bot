@@ -1,108 +1,123 @@
 # TM-Trading-Bot
 
-A small, risk-limited **market-making bot** for tokenized-stock orderbooks on
+A risk-limited **market-making bot** for tokenized-stock orderbooks on
 [True Markets](https://truemarkets.co), built for the **Orderbook Arena** competition,
-plus a **platform QA probe** that turns API quirks into bug reports.
+plus a **platform QA probe** that turns API quirks into bug reports ([docs/FEEDBACK.md](docs/FEEDBACK.md)).
 
-> ⚠️ **Real money.** True Markets has no public test mode, so every live order moves real funds.
-> The bot runs in **paper mode by default**. Live trading needs `--live` and a typed confirmation.
-> Per the Arena page, trading is **not available in the US or UK**. Check your eligibility
-> with True Markets before trading live.
+> ⚠️ **Real money.** There is no test mode. The bot runs in **paper mode by default**; live trading
+> needs `--live` and a typed confirmation. Run it on **one computer only** (see the instance lock below).
 
-## How it scores
+## Scoring
 
-Arena points = USD volume, with **maker fills ×3** and taker fills ×1. The **book of the day** counts ×2 on top.
-The 12 eligible books are NVDAC, TSLAC, AAPLC, MSFTC, AMZNC, GOOGLC, METAC, PLTRC, MSTRC, MUC, SNDKC and SPCXC.
-Rules: no self-trading, wallets funded from the same address count as one entrant,
-and at most 30% of your volume with any single counterparty.
+Arena points = **3 × maker USD volume + 1 × taker USD volume**, and the **book of the day** (announced
+in Discord) counts **×2** on top. Rules: no self-trading, one entrant, and ≤30% of your volume with any
+single counterparty.
 
 ## Strategy
 
-The books are thin and wide: 40 to 100 bps, with 1 to 3 resting orders. So the bot:
+- **Fair value** = 0.4 × exchange reference price + 0.6 × book mid. When the reference is stale
+  (underlying closed or the feed stopped), it uses the mid only and quotes wider.
+- **Queue priority, never closer than the edge.** Improve the best bid/ask by exactly one tick if
+  that is still ≥ `half_spread` (6 bps regular, 12 bps off-hours) from fair; otherwise join the best
+  price; otherwise sit at our limit behind it. A quote already at the best price isn't touched
+  (a modify can lose queue priority).
+- **Maker-only.** The API has no post-only flag, so every place/modify is re-checked against a
+  **fresh** book right before it's sent and skipped if it would cross. Our own bid and ask can never
+  cross each other.
+- **Long-only inventory** with skew: as we accumulate, both quotes move down so we sell back to flat.
+- **Sizes are fractions of equity** (exchange USDC + stocks): 6% per quote, 12% for the book of the
+  day, ≤25% held per book, ≤65% in stocks total, 8% USDC buffer never committed (min $5).
+- **Flow-weighted.** Books with fills get the single order-action slot first. Quiet books quote half
+  size and are re-priced at most every 30 s. The book of the day always goes first.
 
-1. **Computes fair value** as a blend of the exchange's reference price (which tracks the
-   real stock) and the book mid.
-2. **Quotes inside the spread.** It posts a bid one tick above the best bid, but never closer
-   to fair than `min_edge_bps`. Our order becomes top of book, so takers fill against us
-   first (maker ×3), and every fill sits on the right side of fair value.
-3. **Only sells what it holds.** Spot has no shorting. As inventory builds, both quotes skew
-   down, so it sells back toward flat and recycles the same $50 into more volume.
-4. **Never crosses.** It stays at least one tick behind the opposite best price, because the API
-   has no post-only flag. If its own order is the best price, it holds there instead of
-   outbidding itself.
-5. **Risk limits:** per-book and gross position caps, a max-loss kill switch, a sit-out when
-   fair value and mid disagree (the probe found big historical mid dislocations), an API
-   action rate limit, and **cancel-all on exit**.
+## Safety
 
-Optional opportunistic taking (`take_enabled`) hits resting orders that sit far through fair value.
+| Guard | What it does |
+|---|---|
+| Instance lock | One bot per machine, plus a list of order ids this machine placed. If the account has open orders this machine didn't place (e.g. the other computer is running), it **refuses to start**; while running, it **stops**. `--force` cancels them after a typed confirmation. |
+| Loss limits | Daily max loss $20, round max loss $150, persisted in `state/risk.json`, so a restart doesn't reset them. On breach: cancel all, stop, print `!!`. `--reset-risk` clears a halt (asks first). |
+| Volatility pause | If a book's mid moves >40 bps in 30 s, its quotes are pulled for 2 min. |
+| Stale / closed markets | One-sided or empty book, stale reference + wide book, or a long-dead book → that book's quotes are cancelled until it's live again. |
+| USDC buffer | Never commits the last 8% of equity, so orders don't trigger wallet auto-funding. On a 422 "insufficient balance" it shrinks the order to fit instead of retrying. |
+| Wallet watch | Every 5 min, logs any wallet→exchange movement the bot didn't make to `logs/live-prod/wallet_moves.jsonl`. |
+| Keep awake | On Windows the bot stops the PC from sleeping while it runs (restored on exit). |
+| Exit | Ctrl+C, `--until` or a limit → cancels **only this bot's** orders. |
 
-## Setup
+Taker-assist (crossing only to flatten excess inventory, with a daily cost budget) is built in but
+**off** (`taker_assist.enabled: false`) until True Markets confirms deliberate taker trades are fine.
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env
+## Windows (PowerShell) commands
+
+Run from the `TM-Trading-Bot` folder.
+
+```powershell
+git pull
+.venv\Scripts\python -m pip install -r requirements.txt     # after every pull
+.venv\Scripts\python -m pytest -q                           # tests
+
+.venv\Scripts\python -m tmbot market                        # live books + what the bot would quote (no key)
+.venv\Scripts\python -m tmbot status                        # balances + open orders (read-only)
+.venv\Scripts\python -m tmbot report --live                 # points, pace, per-book flow + markouts
+
+# regular hours, stop at 15:55 ET
+.venv\Scripts\python -m tmbot run --live --book-of-day NVDAC --until 15:55
+# overnight / continuous, stop at 09:25 ET tomorrow
+.venv\Scripts\python -m tmbot run --live --book-of-day NVDAC --until 09:25
+# run until Ctrl+C
+.venv\Scripts\python -m tmbot run --live --continuous
+
+.venv\Scripts\python -m tmbot cancel-all                    # EMERGENCY: cancel every order on the account
 ```
 
-For live trading only:
+Paper mode (no key, no money): drop `--live`, e.g. `.venv\Scripts\python -m tmbot run --until 15:55`.
 
-1. Create an API key at <https://app.truemarkets.co/settings/api-keys>. Save the JSON **outside
-   this repo** (e.g. `~/.truemarkets/api-key.json`), then run `chmod 600` on it.
-2. Set `TM_KEY_FILE` in `.env`. `.env` and key files are git-ignored. **This repo is public, so never
-   commit a key.**
-3. Fund the account. The arena gives new traders $50 USDC through a Discord ticket. Limit orders
-   trade on the CeFi venue, so make sure USDC is available to CeFi trading.
-   `python -m tmbot status` shows CeFi balances.
+On macOS, use `.venv/bin/python` instead, and `caffeinate -i` in front to keep the Mac awake.
 
-## Commands
+### Reading the output
 
-```bash
-.venv/bin/python -m tmbot market                 # live books + what the bot would quote (no key)
-.venv/bin/python -m tmbot run                    # PAPER trading on live data (no key)
-.venv/bin/python -m tmbot run --book-of-day NVDAC --minutes 60
-.venv/bin/python -m tmbot report                 # volume / points / PnL (paper)
+| Line | Meaning |
+|---|---|
+| `+ BOOK buy qty @ px` | order placed |
+| `~ BOOK ...` | order re-priced |
+| `x BOOK ... (reason)` | order cancelled (reason shown) |
+| `* FILL ... maker/TAKER BOTD (+pts)` | a trade |
+| `- BOOK ... skipped to stay maker` | the fresh book moved; we didn't send a crossing order |
+| `. ... exchange busy` | normal: True Markets takes one order action at a time |
+| `!` / `!!` | error / the bot stopped itself (read the reason) |
 
-.venv/bin/python -m tmbot status                 # balances + open orders (key, read-only)
-.venv/bin/python -m tmbot run --live             # REAL orders
-.venv/bin/python -m tmbot report --live
-.venv/bin/python -m tmbot cancel-all             # emergency stop
+## Setup (first time)
 
-.venv/bin/python tools/probe.py                  # platform QA report -> reports/
-.venv/bin/python -m pytest -q
+```powershell
+git clone https://github.com/shorjain/TM-Trading-Bot.git
+cd TM-Trading-Bot
+git checkout feat/market-maker-bot
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+copy .env.example .env
 ```
 
-Paper fills are optimistic: an order fills as soon as the market trades through its price,
-with no queue position. Treat paper volume as an upper bound.
+Create a personal API key at <https://app.truemarkets.co/settings/api-keys> and save it as
+`~\.truemarkets\api-key.json` (outside the repo). **This repo is public: never commit a key.**
+Fund the exchange (CeFi) with USDC; the bot spends only exchange USDC.
 
-## Tuning (`config.yaml`)
+## Tuning
 
-| key | default | effect |
-|---|---|---|
-| `books` | all 12 | Fewer books means bigger quotes per book from the same $50 |
-| `book_of_the_day` | null | Set daily from Discord; doubles size there |
-| `strategy.half_spread_bps` | 20 | Target distance from fair; lower = more fills, less edge |
-| `strategy.min_edge_bps` | 8 | Never quote closer to fair than this |
-| `sizing.quote_notional_usd` | 5 | USDC per quote (exchange minimum is $1) |
-| `sizing.max_position_usd` | 12 | Max holding per stock |
-| `risk.max_loss_usd` | 5 | Kill switch on marked-to-market PnL |
+Everything is in [config.yaml](config.yaml), with a comment on every setting. Set `book_of_the_day`
+there to change it without restarting (the running bot re-reads it every minute).
 
 ## Layout
 
 ```
 tmbot/
-  auth.py        API-key token minting (ES256) + payload stamping (Turnkey P-256)
-  client.py      Trading API + public exchange clients; every call logged to logs/*/api.jsonl
-  market.py      EBBO snapshots + reference prices
-  strategy.py    pure quoting logic (unit tested)
-  executor.py    PaperExecutor / LiveExecutor
-  ledger.py      fills, positions, PnL, Arena points
-  bot.py         main loop: data -> strategy -> reconcile -> fills -> risk
-tools/probe.py   read-only platform QA -> Markdown bug report
-docs/FEEDBACK.md feedback for the True Markets team
+  strategy.py   quoting rules (pure, unit tested)
+  bot.py        loop: data -> fills -> risk -> plan -> prioritized actions (fresh cross check)
+  executor.py   paper/live orders, maker/taker inference, 422 shrink
+  market.py     EBBO snapshots, reference age, single-book fresh fetch
+  analytics.py  flow per book, volatility pause, markouts
+  state.py      instance lock + persisted risk limits
+  sessions.py   ET sessions, --until, tradeable hours
+  keepawake.py  Windows sleep prevention
+  ledger.py     fills, PnL, Arena points
+tools/probe.py  read-only platform QA -> Markdown bug report
+docs/           FEEDBACK.md, BEN_UPDATES.md, HANDOFF.md
 ```
-
-## API references
-
-- Docs: <https://docs.truemarkets.co> (Trading API, CeFi exchange docs, increments, price bands)
-- Trading REST: `https://api.truemarkets.co/v1/gateway`
-- Public exchange market data: `https://api.truex.co/v1/cefi/market/quote`

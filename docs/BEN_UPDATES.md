@@ -3,6 +3,26 @@
 Running list of what to tell, ask, or follow up on with Ben (Discord ticket #ticket-0053).
 Newest first. Tick items off once they're sent.
 
+## Draft message (2026-11-20): trading hours, taker rules, auto-funding
+
+> hey ben! first full day went well, the bot did about $570 of volume with almost all of it as
+> maker. a few quick questions so i stay within the rules
+>
+> 1. what are the exact trading hours and days for the stock books? are they open overnight,
+>    on weekends, and on thanksgiving and the day after? i want the bot to pause when the
+>    books aren't really live
+> 2. is it ok within arena rules to do deliberate taker round trips against other participants?
+>    my bot is maker only right now and i want to keep it that way unless you say it's fine.
+>    also does the house market maker count toward the 30% single counterparty limit?
+> 3. during the run about $10.40 moved from my wallet (pyusd and usdc) onto the exchange even
+>    though my bot never calls allocate. i think an order that needed a tiny bit more usdc than
+>    was free triggered auto funding. is there a way to turn auto funding off so it just
+>    rejects instead? it would make bot balances way more predictable
+>
+> thanks!
+
+- [ ] Send the draft above.
+
 ## To send next
 
 - [ ] **Bonus check.** Ask whether my first API trade has registered for the $50 first-trade

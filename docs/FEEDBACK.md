@@ -150,3 +150,27 @@ Clients have to handle both. Converging on one would help, and so would always f
 - **A CeFi order slightly larger than the CeFi balance silently starts a wallet → CeFi allocation**,
   and then other orders fail with `409 an allocation for this listing is already in progress`.
   An opt-out ("never auto-fund from wallet") would make bot behaviour predictable.
+
+## Auto-funding moved wallet money onto the exchange without being asked (2026-11-20)
+
+During a ~3 h live run (an API bot placing only CeFi limit orders, no `POST /custody/allocations`
+calls), about **$10.40 moved from the wallet (PYUSD + USDC) onto the exchange**. The likely cause:
+a buy order or a price-raising `PATCH` that needed a little more USDC than was free on CeFi
+(422s showed it needing ~$0.004 more) quietly triggered a wallet → CeFi allocation, plus a
+PYUSD → USDC conversion. The account owner didn't ask for it, and nothing in the order API
+response says it happened.
+
+Requests:
+- An account- or request-level switch to **never auto-fund from the wallet** (fail with 422 instead).
+- Report it when it happens, e.g. an `allocation_id` on the order response, or a transaction-feed entry.
+
+The bot now keeps a USDC buffer so it never needs auto-funding, and it logs any allocation it didn't
+make to `logs/live-prod/wallet_moves.jsonl` (checked every 5 minutes).
+
+## No post-only / client-order-id (re-confirmed in spec v1.56.0)
+
+`CreateOrderRequest` still has no `post_only`, `time_in_force` or `client_order_id`, and orders
+carry no maker/taker flag. We infer liquidity from the fill price (a maker fills at its limit, a
+taker at a better price), re-check every order against a fresh book before sending, and keep our
+own list of order ids per machine so two bot instances can't trade against each other. A
+`client_order_id` (echoed back on orders) and `post_only` would make all of that unnecessary.
