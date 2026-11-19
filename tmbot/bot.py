@@ -99,8 +99,9 @@ class Bot:
         resized = cur.leaves > 0 and abs(cur.leaves - want.qty) / want.qty > D("0.25")
         if moved or resized:
             new_qty = cur.executed + want.qty
+            old_price = cur.price
             if self._act(f"modify {book} {side}", self.ex.modify, cur, want.price, new_qty):
-                self.log(f"  ~ {book:7} {side:4} {cur.price} -> {want.price} qty {want.qty}")
+                self.log(f"  ~ {book:7} {side:4} {old_price} -> {want.price} qty {want.qty}")
 
     # ---- one iteration ----
     def step(self, i: int) -> None:

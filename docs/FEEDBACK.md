@@ -129,8 +129,9 @@ Clients have to handle both. Converging on one would help, and so would always f
 
 ---
 
-## Live-trading notes (to fill in after running with real funds)
+## Live-trading notes
 
 | date | what I did | expected | actual | request_id |
 |---|---|---|---|---|
-| | | | | |
+| 2026-11-19 11:55 ET | CeFi limit buy AAPLC 0.014 @ 349.246 via API, wallet funded only in PYUSD (Solana); signed the funding-bridge payloads and executed | Either the bridge converts PYUSD → USDC and the order rests, or it fails and nothing moves | Execute returned `422 insufficient_balance` ("needs 4.889444, but only 0 … available") and the order went `failed`, **but PYUSD in the wallet still dropped and 4.889444 USDC showed up in the wallet**. An identical order 2s later succeeded. So a failed execute seems to leave a half-done conversion behind, and the error says 0 available while a conversion is in flight. | c1ccfe94-2d7c-9993-8f3a-6017e91bd358 |
+| 2026-11-19 | Ran `GET /balances` while the bot ran | — | Requests to api.truemarkets.co intermittently took 5–12 s and some TLS handshakes timed out (api.truex.co was fine at the same time) | — |
