@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -152,7 +153,15 @@ class LiveExecutor:
         self._wallet_stable = wallet_stable
 
     def usd_available(self) -> Decimal:
-        return self._bal.get(self.quote_asset, D(0)) + getattr(self, "_wallet_stable", D(0))
+        # Spend only what is already on the exchange. Letting orders pull wallet funds
+        # through the "funding bridge" proved unreliable (2026-11-19): the bridge converts
+        # PYUSD -> USDC, then its allocation races the conversion and is rejected, leaving
+        # the order failed and the USDC stranded in the wallet. Fund the exchange first
+        # with `tmbot allocate --asset USDC`. Set TM_USE_WALLET_FUNDS=1 to opt back in.
+        cefi = self._bal.get(self.quote_asset, D(0))
+        if os.getenv("TM_USE_WALLET_FUNDS") == "1":
+            return cefi + getattr(self, "_wallet_stable", D(0))
+        return cefi
 
     def holding(self, book: str) -> Decimal:
         return self._bal.get(book, D(0))
