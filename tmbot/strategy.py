@@ -7,6 +7,9 @@ queue, but never closer to fair value than `half_spread` (plus inventory skew):
   * else if the best price itself is far enough from fair   -> join it
   * else                                                     -> sit at our limit, behind
 
+Layers: each side has a small "front" order (the rules above) and a larger "depth" order
+`depth_ticks` behind the best price. Big takers sweep the front and fill the depth.
+
 Long-only spot: we only offer what we hold, and as inventory builds both quotes shift
 down so we sell back toward flat (the reducing side may go as close as `min_edge`).
 """
@@ -29,7 +32,8 @@ class Quote:
     side: str  # "buy" | "sell"
     price: Decimal
     qty: Decimal
-    taker: bool = False  # True only for taker-assist (deliberately crosses)
+    taker: bool = False  # True only for taker round trips (deliberately crosses)
+    layer: str = "front"  # "front" | "depth" | "taker"
 
     @property
     def notional(self) -> Decimal:
@@ -45,7 +49,7 @@ class Params:
     book_cap_usd: Decimal = D(15)     # max inventory in this book
     stock_room_usd: Decimal = D(30)   # remaining room under the total stock cap
     extended: bool = False            # off-hours: wider half-spread
-    taker_budget_usd: Decimal = D(0)  # remaining daily taker-assist cost budget
+    layered: bool = True              # quote front + depth layers on this book
 
 
 @dataclass
@@ -66,7 +70,7 @@ def fair_value(book: Book, weight: Decimal) -> Decimal | None:
 
 
 def decide(book: Book, cfg: Config, p: Params, now: float | None = None) -> Decision:
-    s, r, m, ta = cfg.strategy, cfg.risk, cfg.market, cfg.taker_assist
+    s, r, m, lay = cfg.strategy, cfg.risk, cfg.market, cfg.layers
     dec = Decision(book=book.symbol, fair=None)
 
     def pull(reason: str) -> Decision:
@@ -103,17 +107,7 @@ def decide(book: Book, cfg: Config, p: Params, now: float | None = None) -> Deci
     skew = inv * s.inventory_skew_bps
     n = s.no_cross_ticks
 
-    # ---- taker assist (off by default): flatten inventory above the book cap ----
-    if ta.enabled and pos_usd > p.book_cap_usd and spread is not None and spread <= ta.max_spread_bps:
-        excess_qty = round_qty((pos_usd - p.book_cap_usd) / book.bid, book.bid)
-        q = min(excess_qty, round_qty(book.bid_qty, book.bid))
-        cost = q * book.bid * spread / 2 / BPS
-        if meets_min_notional(q, book.bid) and cost <= p.taker_budget_usd:
-            dec.quotes.append(Quote("sell", book.bid, q, taker=True))
-            dec.reasons.append(f"taker-assist: flatten {q} (est. cost ${cost:.4f})")
-            return dec
-
-    # ---- bid ----
+    # ---- bid (front) ----
     bid_cap = fair * (1 - (half + skew) / BPS)
     if book.bid + tick <= bid_cap:
         bid_px = book.bid + tick          # improve by exactly one tick
@@ -122,14 +116,16 @@ def decide(book: Book, cfg: Config, p: Params, now: float | None = None) -> Deci
     else:
         bid_px = bid_cap                  # best is too close to fair: sit behind
     bid_px = round_price(min(bid_px, book.ask - n * tick), "buy")
+    # depth: `depth_ticks` behind the best bid, always behind our front and inside the cap
+    depth_bid_px = round_price(min(book.bid - lay.depth_ticks * tick, bid_px - tick, bid_cap), "buy")
 
     room = min(p.book_cap_usd - pos_usd, p.stock_room_usd, p.usd_budget)
-    bid_qty = qty_for_notional(min(p.quote_usd, room), bid_px) if room > 0 and bid_px > 0 else D(0)
-    bid = Quote("buy", bid_px, bid_qty) if meets_min_notional(bid_qty, bid_px) else None
-    if bid is None:
+    bid_usd = min(p.quote_usd, room) if room > 0 else D(0)
+    bids = _split("buy", bid_usd, bid_px, depth_bid_px, p.layered, lay)
+    if not bids:
         dec.reasons.append("no bid: inventory/capital limit")
 
-    # ---- ask (only what we hold) ----
+    # ---- ask (front), only what we hold ----
     ask_floor = fair * (1 + max(half - skew, s.min_edge_bps) / BPS)
     if book.ask - tick >= ask_floor:
         ask_px = book.ask - tick
@@ -138,22 +134,46 @@ def decide(book: Book, cfg: Config, p: Params, now: float | None = None) -> Deci
     else:
         ask_px = ask_floor
     ask_px = round_price(max(ask_px, book.bid + n * tick), "sell")
+    depth_ask_px = round_price(max(book.ask + lay.depth_ticks * tick, ask_px + tick, ask_floor), "sell")
 
     ask_qty = min(round_qty(p.position_qty, ask_px), qty_for_notional(p.quote_usd, ask_px))
     leftover = p.position_qty - ask_qty
     if leftover > 0 and not meets_min_notional(leftover, ask_px):
         ask_qty = round_qty(p.position_qty, ask_px)  # don't leave sub-$1 dust behind
-    ask = Quote("sell", ask_px, ask_qty) if meets_min_notional(ask_qty, ask_px) else None
-    if ask is None and p.position_qty > 0:
+    asks = _split("sell", ask_qty * ask_px, ask_px, depth_ask_px, p.layered, lay, max_qty=ask_qty)
+    if not asks and p.position_qty > 0:
         dec.reasons.append("no ask: holding below $1 minimum")
 
-    # ---- never let our own quotes cross each other (self-trade) ----
-    if bid and ask and bid.price >= ask.price:
-        bid = None
-        dec.reasons.append("bid dropped: would cross our own ask")
+    # ---- never let any of our bids meet any of our asks (self-trade), across layers ----
+    if asks:
+        lowest_ask = min(q.price for q in asks)
+        kept = [q for q in bids if q.price < lowest_ask]
+        if len(kept) < len(bids):
+            dec.reasons.append("bid dropped: would cross our own ask")
+        bids = kept
 
-    dec.quotes = [q for q in (bid, ask) if q]
+    dec.quotes = bids + asks
     return dec
+
+
+def _split(side: str, usd: Decimal, front_px: Decimal, depth_px: Decimal, layered: bool, lay,
+           max_qty: Decimal | None = None) -> list[Quote]:
+    """Split one side's size into a small front order and a larger depth order. Falls back to a
+    single front order when layering is off or either piece would be under the $1 minimum."""
+    if usd <= 0 or front_px <= 0:
+        return []
+    total_qty = qty_for_notional(usd, front_px) if max_qty is None else max_qty
+    if not meets_min_notional(total_qty, front_px):
+        return []
+    if layered and depth_px > 0:
+        front_qty = round_qty(total_qty * lay.front_pct, front_px)
+        depth_qty = round_qty(total_qty - front_qty, depth_px)
+        if side == "buy":  # cash: the depth layer must fit what's left at its own price
+            depth_qty = min(depth_qty, qty_for_notional(usd - front_qty * front_px, depth_px))
+        if meets_min_notional(front_qty, front_px) and meets_min_notional(depth_qty, depth_px):
+            return [Quote(side, front_px, front_qty, layer="front"),
+                    Quote(side, depth_px, depth_qty, layer="depth")]
+    return [Quote(side, front_px, total_qty, layer="front")]
 
 
 def would_cross(side: str, price: Decimal, best_bid: Decimal | None, best_ask: Decimal | None,

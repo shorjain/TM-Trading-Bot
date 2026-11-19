@@ -29,6 +29,7 @@ class Fill:
     order_id: str
     fee: Decimal = D(0)
     daily_book: bool = False
+    layer: str = ""  # "front" | "depth" | "taker" ("" in logs from before layers existed)
 
     @property
     def notional(self) -> Decimal:
@@ -90,6 +91,7 @@ class Ledger:
             r = json.loads(line)
             for k in ("qty", "price", "fee"):
                 r[k] = D(r[k])
+            r = {k: v for k, v in r.items() if k in Fill.__dataclass_fields__}
             self.record(Fill(**r), persist=False)
 
     # ---- reporting ----

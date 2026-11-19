@@ -43,6 +43,7 @@ class LiveOrder:
     placed_at: float = 0.0
     last_action_at: float = 0.0
     taker_intent: bool = False
+    layer: str = "front"
 
     @property
     def leaves(self) -> Decimal:
@@ -109,7 +110,7 @@ class _Base:
         px = px.quantize(D("0.000001"))
         o.executed, o.exec_value = executed, new_value
         maker = classify_maker(o.side, o.price, px, o.taker_intent)
-        return Fill(time.time(), o.book, o.side, q, px, maker, o.order_id, fee=fee)
+        return Fill(time.time(), o.book, o.side, q, px, maker, o.order_id, fee=fee, layer=o.layer)
 
 
 class PaperExecutor(_Base):
@@ -140,9 +141,10 @@ class PaperExecutor(_Base):
         return {}
 
     # -- orders --
-    def place(self, book: str, side: str, price: Decimal, qty: Decimal, taker: bool = False) -> LiveOrder:
+    def place(self, book: str, side: str, price: Decimal, qty: Decimal, taker: bool = False,
+              layer: str = "front") -> LiveOrder:
         o = LiveOrder(f"paper-{next(self._ids)}", book, side, price, qty, placed_at=time.time(),
-                      last_action_at=time.time(), taker_intent=taker)
+                      last_action_at=time.time(), taker_intent=taker, layer="taker" if taker else layer)
         self._own(o)
         return o
 
@@ -256,7 +258,8 @@ class LiveExecutor(_Base):
             except ApiError:
                 pass
 
-    def place(self, book: str, side: str, price: Decimal, qty: Decimal, taker: bool = False) -> LiveOrder:
+    def place(self, book: str, side: str, price: Decimal, qty: Decimal, taker: bool = False,
+              layer: str = "front") -> LiveOrder:
         try:
             resp = self.c.create_limit(self.asset_ids[book], side, str(qty), str(price))
         except ApiError as e:
@@ -270,7 +273,8 @@ class LiveExecutor(_Base):
             qty = smaller
             resp = self.c.create_limit(self.asset_ids[book], side, str(qty), str(price))
         o = LiveOrder(resp["order_id"], book, side, price, qty, placed_at=time.time(),
-                      last_action_at=time.time(), status=resp.get("status", "pending"), taker_intent=taker)
+                      last_action_at=time.time(), status=resp.get("status", "pending"), taker_intent=taker,
+                      layer="taker" if taker else layer)
         self._own(o)
         self._wait_ack(o)
         return o
