@@ -64,10 +64,27 @@ class RiskCfg:
 
 
 @dataclass
-class TakerAssistCfg:
-    enabled: bool = False
-    max_spread_bps: Decimal = D(8)
-    daily_cost_budget_usd: Decimal = D(2)
+class TakerCfg:
+    enabled: bool = True
+    max_spread_bps: Decimal = D(10)
+    daily_cost_budget_usd: Decimal = D(10)
+    max_trade_usd: Decimal = D(40)
+    min_trade_usd: Decimal = D(2)
+    prefer_book_of_the_day: bool = True
+    book_cooldown_secs: float = 20.0
+    fill_wait_secs: float = 2.5
+    cancel_confirm_secs: float = 6.0
+
+
+@dataclass
+class LayersCfg:
+    enabled: bool = True
+    front_pct: Decimal = D("0.25")
+    depth_pct: Decimal = D("0.75")
+    depth_ticks: int = 2
+    depth_requote_bps: Decimal = D(6)
+    depth_refresh_secs: float = 10.0
+    single_layer_books: list = field(default_factory=list)
 
 
 @dataclass
@@ -96,7 +113,8 @@ class Config:
     flow: FlowCfg = field(default_factory=FlowCfg)
     market: MarketCfg = field(default_factory=MarketCfg)
     risk: RiskCfg = field(default_factory=RiskCfg)
-    taker_assist: TakerAssistCfg = field(default_factory=TakerAssistCfg)
+    taker: TakerCfg = field(default_factory=TakerCfg)
+    layers: LayersCfg = field(default_factory=LayersCfg)
     loop: LoopCfg = field(default_factory=LoopCfg)
     pace: PaceCfg = field(default_factory=PaceCfg)
     path: Path | None = None
@@ -147,6 +165,6 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         quote_asset=raw.get("quote_asset", "USDC"),
         path=Path(path),
     )
-    for name in ("strategy", "sizing", "flow", "market", "risk", "taker_assist", "loop", "pace"):
+    for name in ("strategy", "layers", "sizing", "flow", "market", "risk", "taker", "loop", "pace"):
         _fill(getattr(cfg, name), raw.get(name))
     return cfg

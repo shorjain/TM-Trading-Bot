@@ -41,6 +41,19 @@ strategy:
   # half-spread and size apply.
   reference_stale_secs: 180
 
+# Two layers per side. True Markets' match data: the #1 maker sits at the very front with SMALL
+# size and takes the small orders; bigger orders sweep through it into makers resting a few
+# ticks behind with real size. So: a small "front" order at/near the best price, and a larger
+# "depth" order a few ticks behind it (still never closer to fair than half_spread).
+layers:
+  enabled: true
+  front_pct: 0.25            # share of each side's quote size in the front layer
+  depth_pct: 0.75            # share in the depth layer
+  depth_ticks: 2             # depth order sits this many ticks behind the best bid/ask
+  depth_requote_bps: 6       # re-price the depth order only if its target moved this much
+  depth_refresh_secs: 10     # ...and at most this often (front-layer upkeep comes first)
+  single_layer_books: []     # books that quote only one (front) order per side
+
 sizing:
   quote_pct: 0.06            # each quote = 6% of equity
   botd_quote_pct: 0.12       # book of the day quote = 12% of equity
@@ -81,13 +94,19 @@ risk:
   vol_window_secs: 30
   vol_pause_secs: 120
 
-# Taker assist: crosses the spread ONLY to flatten inventory above the book cap, only on
-# tight books, within a daily cost budget. KEEP OFF until True Markets confirms deliberate
-# taker trades are within Arena rules (30% single-counterparty rule).
-taker_assist:
-  enabled: false
-  max_spread_bps: 8
-  daily_cost_budget_usd: 2.0
+# Taker round trips. APPROVED by True Markets (Ben, 2026-11-19). Buy at the best ask, then
+# immediately sell at the best bid (1x points per side, so a round trip of $N earns ~2N
+# points and costs ~spread x N). Only used in spare order-action slots, on tight books.
+taker:
+  enabled: true
+  max_spread_bps: 10          # only cross when the spread is at most this
+  daily_cost_budget_usd: 10.0 # hard cap on taker round-trip losses per ET day
+  max_trade_usd: 40.0         # per round trip notional cap
+  min_trade_usd: 2.0          # don't bother below this
+  prefer_book_of_the_day: true  # 2x points halves the cost per point
+  book_cooldown_secs: 20      # min seconds between round trips on one book (lets maker quotes rest)
+  fill_wait_secs: 2.5         # how long a taker leg may rest before the remainder is cancelled
+  cancel_confirm_secs: 6.0    # self-trade guard: wait this long for our cancels to be confirmed
 
 loop:
   poll_secs: 3.0
