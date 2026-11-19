@@ -121,7 +121,9 @@ def test_bot_skips_order_that_would_cross_fresh_book(cfg):
     bot = Bot(cfg, fake_feed({"NVDAC": stale}, fresh=lambda s: moved), ex,
               Ledger(path="/tmp/tmbot-t1.jsonl"), "t", log=lambda *_: None)
     bot.step(1)
-    assert not ex.orders  # the bid at 100.001 would have crossed; it was skipped
+    # the front bid at 100.001 would have crossed the moved ask: skipped. The depth bid (behind) is fine.
+    assert not any(o.layer == "front" for o in ex.orders.values())
+    assert all(not would_cross(o.side, o.price, D("100.0"), D("100.001")) for o in ex.orders.values())
 
 
 def test_maker_classification_from_price():
@@ -323,3 +325,143 @@ def test_challenge_signature_verifies(tmp_path):
     pk.public_key().verify(encode_dss_signature(r, s), msg, ec.ECDSA(hashes.SHA256()))
     stamp = json.loads(base64.urlsafe_b64decode(kf.stamp('{"x":1}\n') + "=="))
     assert stamp["scheme"] == "SIGNATURE_SCHEME_TK_API_P256" and len(stamp["publicKey"]) == 66
+
+
+# ================= layered quoting =================
+def test_two_layers_per_side_split_and_placement(cfg):
+    d = decide(book(), cfg, params(position_qty=D("0.3")))
+    by = {(q.side, q.layer): q for q in d.quotes}
+    assert set(by) == {("buy", "front"), ("buy", "depth"), ("sell", "front"), ("sell", "depth")}
+    fb, db = by[("buy", "front")], by[("buy", "depth")]
+    assert db.price == D("100.0") - 2 * D("0.001")          # 2 ticks behind the best bid
+    assert db.price < fb.price
+    assert db.qty > fb.qty * 2                                # most size in depth (75/25)
+    fa, da = by[("sell", "front")], by[("sell", "depth")]
+    assert da.price == D("101.0") + 2 * D("0.001") and da.price > fa.price
+    assert fa.qty + da.qty <= D("0.3")                        # never offer more than we hold
+
+
+def test_layers_respect_edge_caps_and_cash_combined(cfg):
+    d = decide(book(bid="100.04", ask="100.06", ref="100.05"), cfg, params(usd_budget=D("20"), quote_usd=D("33")))
+    bids = [q for q in d.quotes if q.side == "buy"]
+    cap = D("100.05") * (1 - D(6) / 10_000)
+    assert all(q.price <= cap for q in bids)                  # both layers inside min edge to fair
+    assert sum(q.notional for q in bids) <= D("20")           # cash budget across BOTH layers
+
+
+def test_layers_never_cross_each_other(cfg):
+    for bid, ask, ref in (("100.000", "100.003", "100.0"), ("99.9", "100.1", "100.0"), ("100", "101", "100.5")):
+        d = decide(book(bid=bid, ask=ask, ref=ref), cfg, params(position_qty=D("0.5")))
+        bids = [q.price for q in d.quotes if q.side == "buy"]
+        asks = [q.price for q in d.quotes if q.side == "sell"]
+        if bids and asks:
+            assert max(bids) < min(asks), (bid, ask, d.quotes)
+
+
+def test_single_layer_books_and_tiny_size_fall_back_to_one_order(cfg):
+    assert len([q for q in decide(book(), cfg, params(layered=False)).quotes if q.side == "buy"]) == 1
+    assert len([q for q in decide(book(), cfg, params(quote_usd=D("1.5"))).quotes if q.side == "buy"]) == 1
+
+
+def test_front_upkeep_runs_before_any_depth_upkeep(cfg):
+    cfg.books = ["NVDAC", "METAC"]
+    ex = PaperExecutor(D(500))
+    books = {s: book(sym=s) for s in cfg.books}
+    bot = Bot(cfg, fake_feed(books), ex, Ledger(path="/tmp/tmbot-t5.jsonl"), "t", log=lambda *_: None)
+    acts = [a for a in bot.plan(books) if a.kind == "place"]
+    layers = [a.quote.layer for a in acts]
+    assert layers.index("depth") > max(i for i, l in enumerate(layers) if l == "front")
+
+
+# ================= self-trade guard + taker =================
+from tmbot.taker import TakerEngine, own_conflicts  # noqa: E402
+
+
+def test_own_conflicts():
+    from tmbot.executor import LiveOrder
+    mine = [LiveOrder("a", "X", "sell", D("100.05"), D(1)), LiveOrder("b", "X", "buy", D("100.00"), D(1)),
+            LiveOrder("c", "X", "sell", D("100.10"), D(1))]
+    assert [o.order_id for o in own_conflicts("buy", D("100.05"), mine)] == ["a"]   # would lift our own ask
+    assert [o.order_id for o in own_conflicts("sell", D("100.00"), mine)] == ["b"]  # would hit our own bid
+    assert own_conflicts("buy", D("100.04"), mine) == []
+
+
+def taker_bot(cfg, ex, fresh_book, log=None):
+    cfg.books = ["NVDAC"]
+    cfg.taker.enabled = True
+    cfg.taker.fill_wait_secs = 0.2
+    cfg.taker.cancel_confirm_secs = 0.3
+    cfg.taker.book_cooldown_secs = 0
+    books = {"NVDAC": fresh_book}
+    bot = Bot(cfg, fake_feed(books), ex, Ledger(path="/tmp/tmbot-tk.jsonl"), "t",
+              log=log or (lambda *_: None), log_dir="/tmp/tmbot-tk-logs")
+    bot.books_now = books
+    return bot
+
+
+def test_taker_round_trip_flattens_and_scores(cfg):
+    Ledger(path="/tmp/tmbot-tk.jsonl").path.unlink(missing_ok=True)
+    ex = PaperExecutor(D(500))
+    tight = book(bid="100.00", ask="100.05", ref="100.02")      # 5 bps
+    bot = taker_bot(cfg, ex, tight)
+    assert bot.taker.round_trip("NVDAC")
+    fills = bot.ledger.fills
+    assert [(f.side, f.maker, f.layer) for f in fills] == [("buy", False, "taker"), ("sell", False, "taker")]
+    assert ex.total_holding("NVDAC") == 0                       # flat again
+    assert bot.taker.budget_left() < cfg.taker.daily_cost_budget_usd
+
+
+def test_taker_cancels_our_resting_orders_before_trading(cfg):
+    ex = PaperExecutor(D(500))
+    tight = book(bid="100.00", ask="100.05", ref="100.02")
+    bot = taker_bot(cfg, ex, tight)
+    own_ask = ex.place("NVDAC", "sell", D("100.05"), D("0.01"), False, "front")   # OUR order is the best ask
+    own_bid = ex.place("NVDAC", "buy", D("100.00"), D("0.01"), False, "depth")
+    seen = []
+    real_place = ex.place
+
+    def spy_place(book_, side, price, qty, taker=False, layer="front"):
+        if taker:
+            seen.append({o.order_id for o in ex.orders.values() if o.book == book_})
+        return real_place(book_, side, price, qty, taker, layer)
+
+    ex.place = spy_place
+    bot.taker.round_trip("NVDAC")
+    # at the moment ANY taker order was sent, we had zero orders on that book
+    assert len(seen) == 2 and all(s == set() for s in seen)
+    assert own_ask.order_id not in ex.orders and own_bid.order_id not in ex.orders
+
+
+def test_taker_skips_when_cancel_not_confirmed(cfg):
+    class SlowCancel(PaperExecutor):
+        def cancel(self, o):
+            o.status = "cancel_pending"  # exchange never confirms
+
+    ex = SlowCancel(D(500))
+    bot = taker_bot(cfg, ex, book(bid="100.00", ask="100.05", ref="100.02"))
+    ex.place("NVDAC", "sell", D("100.05"), D("0.01"), False, "front")
+    sent = []
+    real_place = ex.place
+    ex.place = lambda *a, **k: sent.append(a) or real_place(*a, **k)
+    assert not bot.taker.round_trip("NVDAC")
+    assert sent == []                                            # no taker order was sent
+
+
+def test_taker_respects_spread_and_budget(cfg):
+    ex = PaperExecutor(D(500))
+    wide = book(bid="100.00", ask="100.20", ref="100.1")          # 20 bps > 10 bps max
+    bot = taker_bot(cfg, ex, wide)
+    assert not bot.taker.round_trip("NVDAC") and not bot.ledger.fills
+    bot2 = taker_bot(cfg, PaperExecutor(D(500)), book(bid="100.00", ask="100.05", ref="100.02"))
+    bot2.taker._spent = cfg.taker.daily_cost_budget_usd           # budget used up
+    assert not bot2.taker.maybe_trade(bot2.books_now)
+
+
+def test_taker_prefers_book_of_the_day(cfg):
+    cfg.books = ["NVDAC", "METAC"]
+    cfg.book_of_the_day = "METAC"
+    books = {"NVDAC": book(sym="NVDAC", bid="100.00", ask="100.02", ref="100.01"),
+             "METAC": book(sym="METAC", bid="100.00", ask="100.08", ref="100.04")}
+    bot = Bot(cfg, fake_feed(books), PaperExecutor(D(500)), Ledger(path="/tmp/tmbot-t6.jsonl"), "t",
+              log=lambda *_: None)
+    assert bot.taker.candidates(books)[0] == "METAC"
