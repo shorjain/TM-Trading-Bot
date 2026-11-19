@@ -138,3 +138,15 @@ Clients have to handle both. Converging on one would help, and so would always f
 | 2026-11-19 12:12 ET | **Root cause found.** CeFi limit buy (NVDAC 0.173 @ 144.253, ~$25) with 4.89 USDC on CeFi and PYUSD in the wallet; signed the bridge payloads | Bridge converts PYUSD → USDC, allocates it, order rests | Conversion **happened** (PYUSD 26.22 → 11.04, wallet USDC 4.89 → 20.07), but the two USDC allocations of 20.066325 were **rejected 1 s apart** ("wallet balance does not cover the allocation") because they ran before the conversion settled. The order failed and $15.18 was left unallocated in the wallet. This is the same race as the 11:55 incident. Suggest: allocate only after the swap confirms, or retry the allocation. Note: allocating USDC by hand with `POST /custody/allocations` works. | 49f483ca-b818-96e8-adcb-712b5fc90189 |
 | 2026-11-19 12:10 ET | Looked at SNDKC | Book near the reference price | SNDKC bid 801.310 / ask 801.311 (0.01 bps, nearly locked) while `reference_price` was 761.27, a ~5% gap | — |
 | 2026-11-19 | Ran `GET /balances` while the bot ran | — | Requests to api.truemarkets.co intermittently took 5–12 s and some TLS handshakes timed out (api.truex.co was fine at the same time) | — |
+
+## API behaviour that isn't documented (found while running live, 2026-11-19)
+
+- **One order action at a time per account.** A second `POST /orders` or `PATCH /orders/{id}`
+  while one is still processing returns `409 conflict: user already has an order in flight`.
+  This is a big constraint for a market maker quoting several books. Please document it,
+  or better, allow some concurrency, or offer a batch order endpoint.
+- **`PATCH /orders/{id}` on a just-created order** returns `400 order in invalid state` until the
+  order is `active`. Fair enough, but it isn't documented.
+- **A CeFi order slightly larger than the CeFi balance silently starts a wallet → CeFi allocation**,
+  and then other orders fail with `409 an allocation for this listing is already in progress`.
+  An opt-out ("never auto-fund from wallet") would make bot behaviour predictable.

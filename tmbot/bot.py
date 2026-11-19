@@ -42,6 +42,7 @@ class Bot:
         self.running = True
         self.start_ts = time.time()
         self.marks: dict[str, Decimal] = {}
+        self._backoff_until = 0.0
         self.last_decisions: dict[str, Decision] = {}
 
     # ---- helpers ----
@@ -66,6 +67,10 @@ class Bot:
         return replace(b, **changes) if changes else b
 
     def _act(self, what: str, fn, *args) -> bool:
+        # The gateway handles one order action per account at a time ("user already has an
+        # order in flight"). After such a conflict, back off briefly instead of piling on.
+        if time.time() < self._backoff_until:
+            return False
         if not self.limiter.allow():
             self.log(f"  rate limit: skipped {what}")
             return False
@@ -73,6 +78,10 @@ class Bot:
             fn(*args)
             return True
         except ApiError as e:
+            if e.status == 409:
+                self._backoff_until = time.time() + 2.0
+                self.log(f"  . {what}: exchange busy ({e.message}); retrying shortly")
+                return False
             self.log(f"  ! {what} failed: {e}")
             if e.status in (401, 403):
                 # Retrying won't help (e.g. "trading is not available in this country").
@@ -95,6 +104,8 @@ class Bot:
                          want.price, want.qty, "", want.taker):
                 self.log(f"  + {book:7} {side:4} {want.qty} @ {want.price}{' (take)' if want.taker else ''}")
             return
+        if cur.status != "active":
+            return  # still being accepted by the exchange; can't modify yet
         moved = abs(cur.price - want.price) / want.price * BPS > self.cfg.strategy.requote_threshold_bps
         resized = cur.leaves > 0 and abs(cur.leaves - want.qty) / want.qty > D("0.25")
         if moved or resized:
@@ -118,7 +129,7 @@ class Bot:
             self.log(f"  * FILL {f.book} {f.side} {f.qty} @ {f.price} {'maker' if f.maker else 'taker'}"
                      f" (+{f.points:.2f} pts)")
 
-        if i % self.cfg.loop.reconcile_every == 0:
+        if True:  # balances every step: cheap, and stale cash caused over-commits
             try:
                 self.ex.refresh_balances()
             except ApiError as e:
@@ -132,12 +143,10 @@ class Bot:
             return
 
         gross = self._gross_usd()
-        # One cash budget shared by every book: free cash plus what our own resting bids
-        # already hold (we may move those). Each book's new bid is deducted before the
-        # next book decides, so the bot can never commit the same dollar twice.
-        all_own_bids = sum((o.leaves * o.price for o in self.ex.orders.values()
-                            if o.side == "buy" and o.status in ("active", "initialized", "pending")), D(0))
-        budget = self.ex.usd_available() + all_own_bids
+        # One cash budget shared by every book: total exchange USDC, which already includes
+        # what our own resting bids hold. Each book's bid is deducted before the next book
+        # decides, so the bot can never commit the same dollar twice.
+        budget = self.ex.usd_budget()
         for sym in self.cfg.books:
             b = books.get(sym)
             if b is None:

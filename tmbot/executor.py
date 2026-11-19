@@ -54,6 +54,9 @@ class PaperExecutor:
         held = sum((o.leaves * o.price for o in self.orders.values() if o.side == "buy"), D(0))
         return self.cash - held
 
+    def usd_budget(self) -> Decimal:
+        return self.cash
+
     def holding(self, book: str) -> Decimal:
         held = sum((o.leaves for o in self.orders.values() if o.side == "sell" and o.book == book), D(0))
         return self.holdings.get(book, D(0)) - held
@@ -135,11 +138,13 @@ class LiveExecutor:
     # -- balances (CeFi trading account) --
     def refresh_balances(self) -> None:
         bal: dict[str, Decimal] = {}
+        totals: dict[str, Decimal] = {}
         wallet_stable = D(0)
         for row in self.c.balances():
             avail = D(str(row.get("available") or 0))
             if row.get("venue") == "cefi":
                 bal[row["symbol"]] = bal.get(row["symbol"], D(0)) + avail
+                totals[row["symbol"]] = totals.get(row["symbol"], D(0)) + D(str(row.get("total") or 0))
             elif row.get("stable") and row.get("symbol") in ("USDC", "PYUSD"):
                 # Stablecoins in the on-chain wallet. A CeFi buy without enough exchange
                 # balance comes back with a "funding bridge" to sign, which moves these
@@ -150,7 +155,12 @@ class LiveExecutor:
                 allocated = D(str(row.get("allocated") or 0))
                 wallet_stable += max(avail - allocated, D(0))
         self._bal = bal
+        self._totals = totals
         self._wallet_stable = wallet_stable
+
+    def usd_budget(self) -> Decimal:
+        """Total exchange USDC, including what our resting bids hold."""
+        return getattr(self, "_totals", {}).get(self.quote_asset, D(0))
 
     def usd_available(self) -> Decimal:
         # Spend only what is already on the exchange. Letting orders pull wallet funds
@@ -176,8 +186,18 @@ class LiveExecutor:
         resp = self.c.create_limit(self.asset_ids[book], side, str(qty), str(price))
         o = LiveOrder(resp["order_id"], book, side, price, qty, placed_at=time.time(),
                       status=resp.get("status", "active"), taker_intent=taker)
-        o.seen_resting = o.status == "active"
         self.orders[o.order_id] = o
+        # Wait (briefly) until the exchange has accepted it; the gateway rejects any other
+        # order action while one is "in flight".
+        for _ in range(8):
+            if o.status not in ("initialized", "pending"):
+                break
+            time.sleep(0.5)
+            try:
+                o.status = self.c.order(o.order_id).get("status", o.status)
+            except ApiError:
+                pass
+        o.seen_resting = o.status == "active"
         return o
 
     def modify(self, o: LiveOrder, price: Decimal, qty: Decimal) -> None:
