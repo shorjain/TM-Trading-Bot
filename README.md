@@ -27,8 +27,16 @@ single counterparty.
 - **Long-only inventory** with skew: as we accumulate, both quotes move down so we sell back to flat.
 - **Sizes are fractions of equity** (exchange USDC + stocks): 6% per quote, 12% for the book of the
   day, ≤25% held per book, ≤65% in stocks total, 8% USDC buffer never committed (min $5).
+- **Two layers per side.** A small **front** order (25%) at the best price, and a larger **depth**
+  order (75%) 2 ticks behind it. That matches what True Markets saw: the #1 maker takes the small
+  orders at the very front, and bigger orders sweep through into makers resting just behind.
+  Caps and the cash buffer apply to both layers combined, and all front-layer upkeep runs before any
+  depth-layer upkeep.
 - **Flow-weighted.** Books with fills get the single order-action slot first. Quiet books quote half
   size and are re-priced at most every 30 s. The book of the day always goes first.
+- **Taker round trips** (approved by True Markets 2026-11-19). In spare action slots, on books with
+  spreads ≤ 10 bps (book of the day first), the bot buys at the ask and immediately sells at the bid.
+  That's 2N points for about spread × N in cost, capped at $10/day, and the cost counts toward the loss limits.
 
 ## Safety
 
@@ -43,8 +51,10 @@ single counterparty.
 | Keep awake | On Windows the bot stops the PC from sleeping while it runs (restored on exit). |
 | Exit | Ctrl+C, `--until` or a limit → cancels **only this bot's** orders. |
 
-Taker-assist (crossing only to flatten excess inventory, with a daily cost budget) is built in but
-**off** (`taker_assist.enabled: false`) until True Markets confirms deliberate taker trades are fine.
+**Self-trade guard for taker trades.** The API has no client-order-id, so before any taker order the
+bot cancels **every** order of ours on that book (both sides, both layers), waits until the exchange
+confirms them gone, re-reads a fresh book, and only then trades. If a cancel isn't confirmed it
+skips the trade. Maker quotes come back on the next loop.
 
 ## Windows (PowerShell) commands
 
@@ -80,7 +90,8 @@ On macOS, use `.venv/bin/python` instead, and `caffeinate -i` in front to keep t
 | `+ BOOK buy qty @ px` | order placed |
 | `~ BOOK ...` | order re-priced |
 | `x BOOK ... (reason)` | order cancelled (reason shown) |
-| `* FILL ... maker/TAKER BOTD (+pts)` | a trade |
+| `* FILL ... maker/TAKER [layer] BOTD (+pts)` | a trade (layer = front / depth / taker) |
+| `> TAKER ...` / `< TAKER ... +pts for $cost` | a taker round trip started / finished |
 | `- BOOK ... skipped to stay maker` | the fresh book moved; we didn't send a crossing order |
 | `. ... exchange busy` | normal: True Markets takes one order action at a time |
 | `!` / `!!` | error / the bot stopped itself (read the reason) |
@@ -114,6 +125,7 @@ tmbot/
   executor.py   paper/live orders, maker/taker inference, 422 shrink
   market.py     EBBO snapshots, reference age, single-book fresh fetch
   analytics.py  flow per book, volatility pause, markouts
+  taker.py      taker round trips + self-trade guard
   state.py      instance lock + persisted risk limits
   sessions.py   ET sessions, --until, tradeable hours
   keepawake.py  Windows sleep prevention
