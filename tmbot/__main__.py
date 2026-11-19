@@ -292,31 +292,53 @@ def cmd_report(args, cfg) -> None:
     run_h = RiskState("state/risk.json").run_hours() if args.live else 0.0
     allp = led.summary(marks, 0.0)
     pts = allp["points"]
-    print("== per book (all time)")
-    mk = markout_summary(base / "markouts.jsonl")
-    print(f"  {'book':7} {'fills':>5} {'maker $':>9} {'taker $':>8} {'pts':>8} {'$/run-h':>8} "
-          f"{'mk10s bps':>10} {'mk60s bps':>10}")
+    print("== per book and layer (all time)")
+    mk = markout_summary(base / "markouts.jsonl", by_layer=True)
+    print(f"  {'book':7} {'layer':6} {'fills':>5} {'maker $':>9} {'taker $':>8} {'pts':>8} {'$/run-h':>8} "
+          f"{'mk10s bps':>12} {'mk60s bps':>12}")
     for b in books_list:
-        fs = [f for f in led.fills if f.book == b]
-        if not fs:
-            continue
-        mv = sum((f.notional for f in fs if f.maker), D(0))
-        tv = sum((f.notional for f in fs if not f.maker), D(0))
-        bp = sum((f.points for f in fs), D(0))
-        vph = f"{float(mv + tv) / run_h:.0f}" if run_h else "-"
-        m10 = mk.get(b, {}).get(10)
-        m60 = mk.get(b, {}).get(60)
-        f10 = f"{m10[0]:+.1f} (n{m10[1]})" if m10 else "-"
-        f60 = f"{m60[0]:+.1f} (n{m60[1]})" if m60 else "-"
-        print(f"  {b:7} {len(fs):5} {mv:9.2f} {tv:8.2f} {bp:8.0f} {vph:>8} {f10:>10} {f60:>10}")
-    print("  markout = mid move after our fill, + is good for us, - means we were picked off")
+        fs_b = [f for f in led.fills if f.book == b]
+        for layer in ("front", "depth", "taker", ""):
+            fs = [f for f in fs_b if (f.layer or "") == layer]
+            if not fs:
+                continue
+            mv = sum((f.notional for f in fs if f.maker), D(0))
+            tv = sum((f.notional for f in fs if not f.maker), D(0))
+            bp = sum((f.points for f in fs), D(0))
+            vph = f"{float(mv + tv) / run_h:.0f}" if run_h else "-"
+            m = mk.get(b, {}).get(layer or "-", {})
+            f10 = f"{m[10][0]:+.1f} (n{m[10][1]})" if 10 in m else "-"
+            f60 = f"{m[60][0]:+.1f} (n{m[60][1]})" if 60 in m else "-"
+            print(f"  {b:7} {layer or 'old':6} {len(fs):5} {mv:9.2f} {tv:8.2f} {bp:8.0f} {vph:>8} {f10:>12} {f60:>12}")
+    print("  markout = mid move after our fill; + is good for us, - means we were picked off")
+
+    tpath = base / "taker.jsonl"
+    if tpath.exists():
+        import json as _json
+        rows = [_json.loads(x) for x in tpath.read_text().splitlines() if x.strip()]
+        print("== taker round trips (all time)")
+        print(f"  {'book':7} {'trips':>5} {'taker pts':>10} {'cost $':>8} {'$ per 1k pts':>13}")
+        tot_p = tot_c = D(0)
+        today0 = today_start_utc()
+        today_c = D(0)
+        for b in sorted({r["book"] for r in rows}):
+            rs = [r for r in rows if r["book"] == b]
+            pts_b = sum((D(r["points"]) for r in rs), D(0))
+            cost_b = sum((D(r["cost"]) for r in rs), D(0))
+            tot_p, tot_c = tot_p + pts_b, tot_c + cost_b
+            today_c += sum((D(r["cost"]) for r in rs if r["ts"] >= today0), D(0))
+            cpk = f"{cost_b / pts_b * 1000:.3f}" if pts_b else "-"
+            print(f"  {b:7} {len(rs):5} {pts_b:10.0f} {cost_b:8.3f} {cpk:>13}")
+        cpk = f"{tot_c / tot_p * 1000:.3f}" if tot_p else "-"
+        print(f"  {'total':7} {len(rows):5} {tot_p:10.0f} {tot_c:8.3f} {cpk:>13}"
+              f"   (today ${today_c:.2f} of ${cfg.taker.daily_cost_budget_usd} budget)")
 
     goal = D(args.goal) if args.goal else cfg.pace.goal_points
     round_end = datetime(2026, 11, 30, 23, 59, tzinfo=timezone.utc).astimezone(ET)
     hours_left = tradeable_hours_between(now_et(), round_end, cfg.pace)
     need = max(goal - pts, D(0))
     print("== leaderboard pace")
-    print(f"  points (this machine's log)  {pts:.0f} / goal {goal:.0f}")
+    print(f"  points (this machine's log)  {pts:.0f} / goal {goal:.0f}   (maker + taker, incl. book-of-day 2x)")
     if run_h:
         print(f"  bot run time                 {run_h:.1f} h  ->  {float(pts) / run_h:.0f} pts/h, "
               f"${float(allp['maker_volume'] + allp['taker_volume']) / run_h:.0f} volume/h")

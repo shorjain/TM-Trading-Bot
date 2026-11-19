@@ -120,7 +120,7 @@ class Markouts:
             while p.due and mid and now - p.fill.ts >= p.due[0]:
                 h = p.due.pop(0)
                 rec = {"ts": p.fill.ts, "book": p.fill.book, "side": p.fill.side, "price": str(p.fill.price),
-                       "qty": str(p.fill.qty), "maker": p.fill.maker, "horizon_s": h,
+                       "qty": str(p.fill.qty), "maker": p.fill.maker, "layer": p.fill.layer, "horizon_s": h,
                        "mid_at_fill": str(p.mid_at_fill), "mid_later": str(mid),
                        "markout_bps": str(round(self.value_bps(p.fill.side, p.fill.price, mid), 3))}
                 with self.path.open("a") as fh:
@@ -130,12 +130,15 @@ class Markouts:
         self.pending = keep
 
 
-def markout_summary(path: str | Path) -> dict[str, dict[int, tuple[float, int]]]:
-    """{book: {horizon: (avg_bps, n)}} from a markouts.jsonl file."""
-    acc: dict[str, dict[int, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+def markout_summary(path: str | Path, by_layer: bool = False) -> dict:
+    """{book: {horizon: (avg_bps, n)}}, or {book: {layer: {horizon: (avg_bps, n)}}} with by_layer."""
+    acc: dict = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.defaultdict(list)))
     p = Path(path)
     if p.exists():
         for line in p.read_text().splitlines():
             r = json.loads(line)
-            acc[r["book"]][int(r["horizon_s"])].append(float(r["markout_bps"]))
-    return {b: {h: (sum(v) / len(v), len(v)) for h, v in hs.items()} for b, hs in acc.items()}
+            layer = r.get("layer") or "-" if by_layer else "all"
+            acc[r["book"]][layer][int(r["horizon_s"])].append(float(r["markout_bps"]))
+    out = {b: {lay: {h: (sum(v) / len(v), len(v)) for h, v in hs.items()} for lay, hs in ls.items()}
+           for b, ls in acc.items()}
+    return out if by_layer else {b: ls.get("all", {}) for b, ls in out.items()}

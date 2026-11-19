@@ -83,10 +83,17 @@ class Bot:
         self.botd_from_cli = False
         self.last_decisions: dict[str, Decision] = {}
         self.feed.set_books(cfg.all_books())
+        from .taker import TakerEngine  # local import: taker.py depends on this module's types
+        self.taker = TakerEngine(self) if cfg.taker.enabled else None
 
     # ------------------------------------------------------------------ helpers
-    def _ours(self, book: str, side: str) -> list[LiveOrder]:
-        return [o for o in self.ex.orders.values() if o.book == book and o.side == side and o.status in OPEN]
+    def _ours(self, book: str, side: str, layer: str | None = None) -> list[LiveOrder]:
+        return [o for o in self.ex.orders.values() if o.book == book and o.side == side and o.status in OPEN
+                and (layer is None or o.layer == layer)]
+
+    def own_orders_on(self, book: str) -> list[LiveOrder]:
+        """Every order of ours on a book that could still trade (incl. cancels not yet confirmed)."""
+        return [o for o in self.ex.orders.values() if o.book == book]
 
     def _equity(self) -> tuple[Decimal, Decimal]:
         """(equity, stock value) on the exchange, stocks marked at mid."""
@@ -209,7 +216,6 @@ class Bot:
         buffer = max(equity * z.usdc_buffer_pct, z.usdc_buffer_min_usd)
         cash_budget = self.ex.usd_total() - buffer          # includes our current bid holds
         stock_room = equity * z.total_stock_cap_pct - stock_val
-        taker_budget = cfg.taker_assist.daily_cost_budget_usd - (self.risk.taker_cost_today() if self.risk else D(0))
         actions: list[Action] = []
         for rank, sym in enumerate(self._priority_books()):
             prio = float(rank) + 1
@@ -228,46 +234,57 @@ class Bot:
             low = self._low_flow(sym)
             if low:
                 quote_usd *= cfg.flow.low_flow_size_mult
+            layered = cfg.layers.enabled and sym not in cfg.layers.single_layer_books
             p = Params(position_qty=self.ex.total_holding(sym), usd_budget=max(cash_budget, D(0)),
                        quote_usd=quote_usd, book_cap_usd=equity * z.book_cap_pct,
-                       stock_room_usd=max(stock_room, D(0)), extended=extended,
-                       taker_budget_usd=max(taker_budget, D(0)))
+                       stock_room_usd=max(stock_room, D(0)), extended=extended, layered=layered)
             d = decide(self._without_own(b), cfg, p)
             self.last_decisions[sym] = d
-            want = {q.side: q for q in d.quotes}
-            if "buy" in want:
-                cash_budget -= want["buy"].notional
+            want = {(q.side, q.layer): q for q in d.quotes}
+            cash_budget -= sum((q.notional for q in d.quotes if q.side == "buy"), D(0))
             for side in ("buy", "sell"):
-                actions += self._side_actions(sym, side, want.get(side), b, prio, low, d)
+                # front-layer upkeep for every book runs before ANY depth-layer upkeep
+                actions += self._side_actions(sym, side, "front", want.get((side, "front")), b, prio, low, d)
+                actions += self._side_actions(sym, side, "depth", want.get((side, "depth")), b, 100 + prio, low, d)
+            # orders from a layer we no longer use (e.g. layering switched off) are cancelled
+            for o in [o for o in self.ex.orders.values() if o.book == sym and o.status in OPEN
+                      and o.layer not in ("front", "depth")]:
+                actions.append(Action(0.5, sym, "cancel", o.side, order=o, why=f"stray {o.layer} order"))
         actions.sort(key=lambda a: a.priority)
         return actions
 
-    def _side_actions(self, book: str, side: str, want: Quote | None, raw: Book, prio: float,
+    def _side_actions(self, book: str, side: str, layer: str, want: Quote | None, raw: Book, prio: float,
                       low_flow: bool, d: Decision) -> list[Action]:
-        live = self._ours(book, side)
-        out = [Action(0.5, book, "cancel", side, order=o, why="duplicate") for o in live[1:]]
+        live = self._ours(book, side, layer)
+        out = [Action(0.5, book, "cancel", side, order=o, why=f"duplicate {layer}") for o in live[1:]]
         cur = live[0] if live else None
         if want is None:
             if cur:
                 out.append(Action(0.5 if d.pull else prio, book, "cancel", side, order=cur,
-                                  why="; ".join(d.reasons) or "no quote wanted"))
+                                  why=f"{layer}: " + ("; ".join(d.reasons) or "no quote wanted")))
             return out
         if cur is None:
             out.append(Action(prio, book, "place", side, quote=want))
             return out
         if cur.status != "active":
             return out  # still being accepted; can't modify yet
-        s = self.cfg.strategy
+        s, lay = self.cfg.strategy, self.cfg.layers
         gap_bps = abs(cur.price - want.price) / want.price * BPS
-        moved = gap_bps > s.requote_threshold_bps
         downsize = cur.leaves > want.qty * D("1.25")
         upsize = cur.leaves < want.qty * D("0.6")
-        at_best = (raw.bid == cur.price) if side == "buy" else (raw.ask == cur.price)
-        # Queue priority: a modify can lose our place in line. Leave an order alone while it's
-        # at the best price and close to target, unless it must shrink (capital/inventory).
-        if at_best and gap_bps < s.queue_hold_bps and not downsize:
-            return out
-        if low_flow and time.time() - cur.last_action_at < self.cfg.flow.low_flow_refresh_secs and not downsize:
+        since = time.time() - cur.last_action_at
+        if layer == "depth":
+            moved = gap_bps > lay.depth_requote_bps
+            if since < lay.depth_refresh_secs and not downsize:
+                return out
+        else:
+            moved = gap_bps > s.requote_threshold_bps
+            at_best = (raw.bid == cur.price) if side == "buy" else (raw.ask == cur.price)
+            # Queue priority: a modify can lose our place in line. Leave the front order alone while
+            # it's at the best price and close to target, unless it must shrink (capital/inventory).
+            if at_best and gap_bps < s.queue_hold_bps and not downsize:
+                return out
+        if low_flow and since < self.cfg.flow.low_flow_refresh_secs and not downsize:
             return out
         if moved or downsize or upsize:
             out.append(Action(prio + 0.1, book, "modify", side, order=cur, quote=want))
@@ -306,19 +323,14 @@ class Bot:
         try:
             if a.kind == "cancel":
                 self.ex.cancel(a.order)
-                self.log(f"  x {a.book:7} {a.side:4} cancel {a.order.price} ({a.why})")
+                self.log(f"  x {a.book:7} {a.side:4} cancel {a.order.price} [{a.order.layer}] ({a.why})")
             elif a.kind == "place":
-                o = self.ex.place(a.book, a.side, a.quote.price, a.quote.qty, a.quote.taker)
-                tag = " (TAKER-ASSIST)" if a.quote.taker else ""
-                self.log(f"  + {a.book:7} {a.side:4} {o.qty} @ {o.price}{tag}")
-                if a.quote.taker and self.risk:
-                    b = self.books_now.get(a.book)
-                    if b and b.spread_bps is not None:
-                        self.risk.add_taker_cost(a.quote.notional * b.spread_bps / 2 / BPS)
+                o = self.ex.place(a.book, a.side, a.quote.price, a.quote.qty, False, a.quote.layer)
+                self.log(f"  + {a.book:7} {a.side:4} {o.qty} @ {o.price} [{o.layer}]")
             else:
                 old = a.order.price
                 self.ex.modify(a.order, a.quote.price, a.order.executed + a.quote.qty)
-                self.log(f"  ~ {a.book:7} {a.side:4} {old} -> {a.order.price} qty {a.order.leaves}")
+                self.log(f"  ~ {a.book:7} {a.side:4} {old} -> {a.order.price} qty {a.order.leaves} [{a.order.layer}]")
             return True
         except ApiError as e:
             if e.status == 409:
@@ -333,16 +345,17 @@ class Bot:
                 self.stop("permission denied")
             return False
 
-    def execute(self, actions: list[Action]) -> int:
-        t0, n = time.time(), 0
-        for a in actions:
+    def execute(self, actions: list[Action]) -> bool:
+        """Run actions in priority order within the time budget. Returns True if the queue was
+        fully worked through (so there is an idle slot left for taker trades)."""
+        t0 = time.time()
+        for idx, a in enumerate(actions):
             if not self.running or time.time() - t0 > self.cfg.loop.action_budget_secs:
-                break
-            if self._do(a):
-                n += 1
+                return False
+            self._do(a)
             if time.time() < self._backoff_until:
-                break
-        return n
+                return False
+        return True
 
     # ------------------------------------------------------------------ one iteration
     def step(self, i: int) -> None:
@@ -357,12 +370,7 @@ class Bot:
             self.flow.observe_trade(sym, b.last_trade_ns)
 
         for f in self.ex.poll_fills(books):
-            f.daily_book = f.book == self.cfg.book_of_the_day
-            self.ledger.record(f)
-            self.flow.add_fill(f)
-            self.markouts.on_fill(f, self.marks.get(f.book))
-            self.log(f"  * FILL {f.book} {f.side} {f.qty} @ {f.price} {'maker' if f.maker else 'TAKER'}"
-                     f"{' BOTD' if f.daily_book else ''} (+{f.points:.1f} pts)")
+            self.record_fill(f)
         self.markouts.update(self.marks)
 
         try:
@@ -375,7 +383,17 @@ class Bot:
         self._check_wallet()
         if not self.running or not self._check_risk():
             return
-        self.execute(self.plan(books))
+        idle = self.execute(self.plan(books))
+        if idle and self.taker is not None and self.running and time.time() >= self._backoff_until:
+            self.taker.maybe_trade(books)
+
+    def record_fill(self, f) -> None:
+        f.daily_book = f.book == self.cfg.book_of_the_day
+        self.ledger.record(f)
+        self.flow.add_fill(f)
+        self.markouts.on_fill(f, self.marks.get(f.book))
+        self.log(f"  * FILL {f.book} {f.side} {f.qty} @ {f.price} {'maker' if f.maker else 'TAKER'} [{f.layer}]"
+                 f"{' BOTD' if f.daily_book else ''} (+{f.points:.1f} pts)")
 
     # ------------------------------------------------------------------ status / run
     def status_line(self) -> str:
