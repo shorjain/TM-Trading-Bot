@@ -27,6 +27,25 @@ ENVS = {
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+def _send_with_retry(http: httpx.Client, method: str, url: str, attempts: int = 3, **kw) -> httpx.Response:
+    """Send a request, retrying network failures.
+
+    Reads (GET) are retried on any network error. Writes (POST/PATCH) are retried only when
+    the connection failed before the request was sent, so an order can never be placed twice.
+    """
+    for i in range(attempts):
+        try:
+            return http.request(method, url, **kw)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            if i == attempts - 1:
+                raise
+        except httpx.TransportError:
+            if method != "GET" or i == attempts - 1:
+                raise
+        time.sleep(1.0 * (i + 1))
+    raise RuntimeError("unreachable")
+
+
 class ApiError(RuntimeError):
     def __init__(self, method: str, path: str, status: int, body: Any):
         self.method, self.path, self.status, self.body = method, path, status, body
@@ -53,14 +72,14 @@ class _Logged:
 class ExchangeData(_Logged):
     """Public market data from the CeFi exchange. Read-only, no credentials."""
 
-    def __init__(self, env: str = "prod", log_dir: str | Path = "logs", timeout: float = 10.0):
+    def __init__(self, env: str = "prod", log_dir: str | Path = "logs", timeout: float = 30.0):
         super().__init__(log_dir)
         self.base = ENVS[env]["exchange"]
         self.http = httpx.Client(timeout=timeout, headers={"User-Agent": "tm-trading-bot/0.1"})
 
     def get(self, path: str, params: dict | None = None) -> Any:
         t0 = time.perf_counter()
-        r = self.http.get(self.base + path, params=params)
+        r = _send_with_retry(self.http, "GET", self.base + path, params=params)
         ms = (time.perf_counter() - t0) * 1000
         try:
             body = r.json()
@@ -91,7 +110,7 @@ class GatewayClient(_Logged):
     """Authenticated Trading API client for your own account."""
 
     def __init__(self, key: KeyFile | None, env: str = "prod", log_dir: str | Path = "logs",
-                 timeout: float = 20.0):
+                 timeout: float = 30.0):
         super().__init__(log_dir)
         self.key = key
         self.base = ENVS[env]["api"]
@@ -127,7 +146,7 @@ class GatewayClient(_Logged):
             self._ensure_token()
             headers["Authorization"] = f"Bearer {self.token.access}"
         t0 = time.perf_counter()
-        r = self.http.request(method, self.base + path, json=body, params=params, headers=headers)
+        r = _send_with_retry(self.http, method, self.base + path, json=body, params=params, headers=headers)
         ms = (time.perf_counter() - t0) * 1000
         try:
             data = r.json() if r.content else {}

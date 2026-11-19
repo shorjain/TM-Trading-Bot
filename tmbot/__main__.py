@@ -111,11 +111,16 @@ def cmd_run(args, cfg) -> None:
 
 def cmd_status(args, cfg) -> None:
     gw = _gateway("logs/status")
-    print("CeFi balances:")
-    for r in gw.balances():
-        if r.get("venue") == "cefi" or r.get("symbol") == "USDC":
-            print(f"  {r['venue']:5} {r['symbol']:8} total {r.get('total')}  available {r.get('available')}"
-                  f"  held {r.get('held')}  allocated {r.get('allocated')}")
+    rows = gw.balances()
+    print("Exchange (CeFi) balances, non-zero:")
+    for r in rows:
+        if r.get("venue") == "cefi" and D(str(r.get("total") or 0)) > 0:
+            print(f"  {r['symbol']:8} total {r.get('total')}  available {r.get('available')}  held {r.get('held')}")
+    print("Wallet (DeFi) balances:")
+    for r in rows:
+        if r.get("venue") != "cefi" and D(str(r.get("total") or 0)) > 0:
+            print(f"  {r['symbol']:8} on {r.get('chain')}  total {r.get('total')}  available {r.get('available')}"
+                  f"  allocated {r.get('allocated')}")
     print("Open orders:")
     for o in gw.list_orders(status="active"):
         print(f"  {o['order_id']}  {o.get('asset_symbol') or o.get('base_asset')}  {o['side']} "
