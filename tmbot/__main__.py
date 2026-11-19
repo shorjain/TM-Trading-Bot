@@ -3,6 +3,7 @@
   python -m tmbot market                      # live books + what the bot would quote (no key needed)
   python -m tmbot run                         # PAPER trading against live data (default, no key needed)
   python -m tmbot run --live                  # REAL orders with real money (needs TM_KEY_FILE)
+  python -m tmbot cross --book GOOGLC --usd 5  # one-shot taker buy at the best ask (asks first)
   python -m tmbot status                      # balances, open orders (read-only, needs key)
   python -m tmbot cancel-all                  # cancel every open CeFi order (needs key)
   python -m tmbot report [--live]             # volume / points / PnL from the fill log
@@ -109,6 +110,48 @@ def cmd_run(args, cfg) -> None:
     Bot(cfg, feed, ex, ledger, mode, log=log).run(max_minutes=args.minutes)
 
 
+def cmd_cross(args, cfg) -> None:
+    """One-shot taker order at the current best price, e.g. to get a first fill.
+    Uses a limit at the touch (never a market order), so it can't fill worse than the price shown."""
+    from .increments import qty_for_notional, round_qty
+    from .ledger import Fill
+    book = args.book.upper()
+    feed = MarketFeed(ExchangeData(_env(), log_dir="logs/live-prod"), [book], cfg.quote_asset)
+    b = feed.snapshot().get(book)
+    if not b or not b.bid or not b.ask:
+        sys.exit(f"no two-sided market for {book}")
+    px = b.ask if args.side == "buy" else b.bid
+    top = b.ask_qty if args.side == "buy" else b.bid_qty
+    qty = min(qty_for_notional(D(args.usd), px), round_qty(top, px))
+    if qty * px < 1:
+        sys.exit(f"top of book too small ({top} @ {px})")
+    print(f"{book}: bid {b.bid} / ask {b.ask}  (spread {b.spread_bps:.1f} bps)")
+    print(f"About to {args.side.upper()} {qty} {book} @ {px} = ${qty * px:.2f} (taker, real money)")
+    if input('Type "yes" to send: ').strip().lower() != "yes":
+        sys.exit("aborted")
+    gw = _gateway("logs/live-prod")
+    ids = _asset_ids(gw, [book])
+    resp = gw.create_limit(ids[book], args.side, str(qty), str(px))
+    oid = resp["order_id"]
+    print(f"order {oid}: {resp.get('status')}")
+    d = resp
+    for _ in range(20):
+        d = gw.order(oid)
+        if d.get("status") in ("complete", "canceled", "failed"):
+            break
+        time.sleep(1.5)
+    executed = D(str(d.get("executed_qty") or 0))
+    print(f"final: {d.get('status')}  filled {executed} @ {d.get('executed_vwap')}  fee {d.get('fee')}"
+          f"  {d.get('failure_reason') or ''}")
+    if d.get("status") not in ("complete", "canceled", "failed"):
+        print("still resting -> cancelling the remainder")
+        gw.cancel(oid)
+    if executed > 0:
+        led = Ledger(Path("logs/live-prod/fills.jsonl"))
+        led.record(Fill(time.time(), book, args.side, executed, D(str(d.get("executed_vwap") or px)),
+                        maker=False, order_id=oid, fee=D(str(d.get("fee") or 0))))
+
+
 def cmd_status(args, cfg) -> None:
     gw = _gateway("logs/status")
     rows = gw.balances()
@@ -164,6 +207,11 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--minutes", type=float, help="stop after N minutes")
     r.add_argument("--paper-usdc", default="50")
 
+    c = sub.add_parser("cross", help="one-shot taker order at the best price (e.g. first fill)")
+    c.add_argument("--book", required=True)
+    c.add_argument("--side", choices=["buy", "sell"], default="buy")
+    c.add_argument("--usd", default="5")
+
     sub.add_parser("status", help="balances and open orders (read-only)")
     sub.add_parser("cancel-all", help="cancel every open CeFi order")
     rep = sub.add_parser("report", help="volume, points and PnL from the fill log")
@@ -171,7 +219,7 @@ def main(argv: list[str] | None = None) -> None:
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)
-    {"market": cmd_market, "run": cmd_run, "status": cmd_status,
+    {"market": cmd_market, "run": cmd_run, "status": cmd_status, "cross": cmd_cross,
      "cancel-all": cmd_cancel_all, "report": cmd_report}[args.cmd](args, cfg)
 
 

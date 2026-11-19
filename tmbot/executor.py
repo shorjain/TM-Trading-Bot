@@ -142,8 +142,12 @@ class LiveExecutor:
             elif row.get("stable") and row.get("symbol") in ("USDC", "PYUSD"):
                 # Stablecoins in the on-chain wallet. A CeFi buy without enough exchange
                 # balance comes back with a "funding bridge" to sign, which moves these
-                # onto the exchange, so they count as spendable.
-                wallet_stable += avail
+                # onto the exchange, so they count as spendable. The docs say `available`
+                # is already net of `allocated`, but in practice it isn't (we saw
+                # available=4.889444 and allocated=4.889444 on the same row), so subtract it
+                # ourselves to avoid counting exchange money twice.
+                allocated = D(str(row.get("allocated") or 0))
+                wallet_stable += max(avail - allocated, D(0))
         self._bal = bal
         self._wallet_stable = wallet_stable
 

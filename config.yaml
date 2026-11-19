@@ -27,11 +27,11 @@ quote_asset: USDC
 
 strategy:
   # Target distance of our quotes from fair value, in basis points.
-  # The live books are ~50-100 bps wide, so 15-25 bps puts us at the top of the book
-  # while still earning edge when a taker hits us.
-  half_spread_bps: 20
+  # 2026-11-19 market hours: books are 10-20 bps wide, so 6 bps keeps us at or near
+  # the front of the queue. (Was 20; that got 0 fills in a 10-minute AAPLC test.)
+  half_spread_bps: 6
   # Never quote tighter than this to fair (protects against adverse selection).
-  min_edge_bps: 8
+  min_edge_bps: 2
   # Stay at least this many ticks behind the opposite best price, so our limit
   # order cannot cross and become a taker (the API has no post-only flag).
   no_cross_ticks: 1
@@ -39,26 +39,27 @@ strategy:
   # by this many bps, so we sell what we hold more eagerly.
   inventory_skew_bps: 25
   # Only replace a resting quote if the new price differs by more than this.
-  requote_threshold_bps: 4
+  requote_threshold_bps: 2
   # Fair value = blend of the exchange reference price and the book mid.
-  # 1.0 = reference only, 0.0 = mid only.
-  reference_weight: 0.7
+  # 1.0 = reference only, 0.0 = mid only. The reference is a 30s candle and lags; AAPLC
+  # traded ~0.4% above it on 2026-11-19, so lean more on the live book.
+  reference_weight: 0.4
   # Taking: hit a resting quote only if it is this far through fair value (pure mispricing).
   take_enabled: false
   take_edge_bps: 60
 
 sizing:
   # USDC notional per quote. Exchange minimum notional is $1.
-  quote_notional_usd: 5.0
+  quote_notional_usd: 8.0
   size_multiplier_daily_book: 2.0
   # Max USDC worth of a single stock we will hold (long only, spot has no shorting).
-  max_position_usd: 12.0
+  max_position_usd: 15.0
   # Max total USDC deployed in stock inventory across books.
-  max_gross_usd: 40.0
+  max_gross_usd: 30.0
 
 risk:
   # Stop the bot (cancel all) if marked-to-market PnL falls below this.
-  max_loss_usd: 5.0
+  max_loss_usd: 3.0
   # Do not quote when the book is wider than this (no reliable mid).
   max_book_spread_bps: 250
   # Do not quote when fair value and mid disagree by more than this.

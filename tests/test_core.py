@@ -154,3 +154,19 @@ def test_challenge_signature_verifies(tmp_path):
     pk.public_key().verify(encode_dss_signature(r, s), msg, ec.ECDSA(hashes.SHA256()))
     stamp = json.loads(base64.urlsafe_b64decode(kf.stamp('{"x":1}\n') + "=="))
     assert stamp["scheme"] == "SIGNATURE_SCHEME_TK_API_P256" and len(stamp["publicKey"]) == 66
+
+
+# ---------------- shared budget across books ----------------
+def test_bids_never_exceed_cash_across_books():
+    import types
+    c = Config(books=["NVDAC", "AAPLC", "TSLAC", "MSFTC"])
+    c.sizing.quote_notional_usd = D(8)
+    c.sizing.max_gross_usd = D(100)
+    ex = PaperExecutor(D(20))
+    books = {s: book(sym=s) for s in c.books}
+    feed = types.SimpleNamespace(snapshot=lambda: books)
+    bot = Bot(c, feed=feed, executor=ex, ledger=Ledger(path="/tmp/tmbot-budget.jsonl"), mode="t", log=lambda *_: None)
+    bot.step(1)
+    committed = sum(o.qty * o.price for o in ex.orders.values() if o.side == "buy")
+    assert committed <= D(20)
+    assert len(ex.orders) == 3  # $8 + $8, then only $4 left -> third bid ~$4, fourth none

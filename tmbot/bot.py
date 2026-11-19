@@ -132,19 +132,24 @@ class Bot:
             return
 
         gross = self._gross_usd()
+        # One cash budget shared by every book: free cash plus what our own resting bids
+        # already hold (we may move those). Each book's new bid is deducted before the
+        # next book decides, so the bot can never commit the same dollar twice.
+        all_own_bids = sum((o.leaves * o.price for o in self.ex.orders.values()
+                            if o.side == "buy" and o.status in ("active", "initialized", "pending")), D(0))
+        budget = self.ex.usd_available() + all_own_bids
         for sym in self.cfg.books:
             b = books.get(sym)
             if b is None:
                 for side in ("buy", "sell"):
                     self._reconcile_side(sym, side, None)
                 continue
-            # What we could deploy if we replaced our own resting orders on this book.
-            own_bid_usd = sum((o.leaves * o.price for o in self._ours(sym, "buy")), D(0))
-            usd = self.ex.usd_available() + own_bid_usd
             pos = self.ex.total_holding(sym)
-            d = decide(self._without_own(b), self.cfg, pos, usd, gross)
+            d = decide(self._without_own(b), self.cfg, pos, max(budget, D(0)), gross)
             self.last_decisions[sym] = d
             want = {q.side: q for q in d.quotes}
+            if "buy" in want:
+                budget -= want["buy"].notional
             for side in ("buy", "sell"):
                 if not self.running:
                     return
