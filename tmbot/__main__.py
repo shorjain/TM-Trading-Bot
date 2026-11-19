@@ -120,13 +120,17 @@ def cmd_cross(args, cfg) -> None:
     b = feed.snapshot().get(book)
     if not b or not b.bid or not b.ask:
         sys.exit(f"no two-sided market for {book}")
-    px = b.ask if args.side == "buy" else b.bid
-    top = b.ask_qty if args.side == "buy" else b.bid_qty
-    qty = min(qty_for_notional(D(args.usd), px), round_qty(top, px))
+    from .increments import round_price
+    touch = b.ask if args.side == "buy" else b.bid
+    # Allow a small, capped slippage: the book moves in the seconds before the order lands.
+    slip = D(args.slip_bps) / D(10_000)
+    px = round_price(touch * (1 + slip), "sell") if args.side == "buy" else round_price(touch * (1 - slip), "buy")
+    qty = qty_for_notional(D(args.usd), px)
     if qty * px < 1:
-        sys.exit(f"top of book too small ({top} @ {px})")
+        sys.exit("order below the $1 minimum")
     print(f"{book}: bid {b.bid} / ask {b.ask}  (spread {b.spread_bps:.1f} bps)")
-    print(f"About to {args.side.upper()} {qty} {book} @ {px} = ${qty * px:.2f} (taker, real money)")
+    print(f"About to {args.side.upper()} {qty} {book} with limit {px} (best {touch}, max slippage {args.slip_bps} bps)"
+          f" = up to ${qty * px:.2f} (taker, real money)")
     if input('Type "yes" to send: ').strip().lower() != "yes":
         sys.exit("aborted")
     gw = _gateway("logs/live-prod")
@@ -286,6 +290,7 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--book", required=True)
     c.add_argument("--side", choices=["buy", "sell"], default="buy")
     c.add_argument("--usd", default="5")
+    c.add_argument("--slip-bps", default="10", help="max price above the ask (buy) / below the bid (sell)")
 
     al = sub.add_parser("allocate", help="make a stock in your wallet tradeable on the exchange")
     al.add_argument("--asset", required=True)
