@@ -243,8 +243,10 @@ def test_instance_lock(tmp_path):
     a.add("mine-1")
     active = [{"order_id": "mine-1"}, {"order_id": "pc-9"}, {"order_id": "svc", "placed_by": "service"}]
     assert [o["order_id"] for o in a.foreign(active)] == ["pc-9"]
-    # a second live process on the same machine is refused
-    (tmp_path / "instance.lock").write_text(json.dumps({"machine": a.machine, "pid": 1, "started": "x"}))
+    # a second live process on the same machine is refused. Use our parent process: it is alive on
+    # every OS (pid 1 doesn't exist on Windows) and isn't this process.
+    import os
+    (tmp_path / "instance.lock").write_text(json.dumps({"machine": a.machine, "pid": os.getppid(), "started": "x"}))
     with pytest.raises(InstanceLockError):
         InstanceLock(tmp_path).acquire()
     # a dead pid's lock is taken over
