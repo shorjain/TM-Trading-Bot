@@ -152,6 +152,72 @@ def cmd_cross(args, cfg) -> None:
                         maker=False, order_id=oid, fee=D(str(d.get("fee") or 0))))
 
 
+def cmd_allocate(args, cfg) -> None:
+    """Make a stock you hold in your wallet (DeFi) tradeable on the exchange (CeFi).
+    No tokens leave your wallet; the amount is reserved for exchange trading."""
+    gw = _gateway("logs/live-prod")
+    sym = args.asset.upper()
+    row = next((r for r in gw.balances() if r.get("venue") == "defi" and r.get("symbol") == sym), None)
+    if not row:
+        sys.exit(f"no {sym} in your wallet")
+    free = D(str(row.get("available") or 0)) - D(str(row.get("allocated") or 0))
+    amount = free if args.amount == "all" else D(args.amount)
+    if amount <= 0 or amount > free:
+        sys.exit(f"{sym}: {free} free to allocate, asked for {amount}")
+    print(f"Allocate {amount} {sym} (wallet on {row.get('chain')}) to exchange trading.")
+    if input('Type "yes" to continue: ').strip().lower() != "yes":
+        sys.exit("aborted")
+    a = gw.post("/custody/allocations", {"asset_id": row["asset_id"], "amount": str(amount)})
+    print(f"allocation {a.get('id')}: {a.get('status')}")
+    for _ in range(40):
+        if a.get("status") in ("completed", "rejected", "stranded"):
+            break
+        time.sleep(2)
+        a = gw.get(f"/custody/allocations/{a['id']}")
+    print(f"final: {a.get('status')} {a.get('failure_reason') or ''}")
+
+
+def cmd_fund(args, cfg) -> None:
+    """Move wallet stablecoins (PYUSD/USDC) onto the exchange as USDC in ONE step.
+
+    How: place a single non-marketable limit buy (well below the market, so it cannot
+    fill), sign the funding bridge it returns, wait until it rests, then cancel it. The
+    converted USDC stays on the exchange. Doing this once avoids a bridge per bot order
+    (money movements are limited to 20/min and 300/day)."""
+    from .increments import qty_for_notional, round_price
+    book = args.book.upper()
+    usd = D(args.usd)
+    feed = MarketFeed(ExchangeData(_env(), log_dir="logs/live-prod"), [book], cfg.quote_asset)
+    b = feed.snapshot().get(book)
+    if not b or not b.bid:
+        sys.exit(f"no bid on {book}")
+    px = round_price(b.bid * D("0.97"), "buy")  # 3% under the best bid: rests, never fills
+    qty = qty_for_notional(usd, px)
+    print(f"Funding ~${qty * px:.2f} USDC onto the exchange via a resting {book} buy "
+          f"{qty} @ {px} (best bid {b.bid}); it will be cancelled right after.")
+    if input('Type "yes" to continue: ').strip().lower() != "yes":
+        sys.exit("aborted")
+    gw = _gateway("logs/live-prod")
+    ids = _asset_ids(gw, [book])
+    resp = gw.create_limit(ids[book], "buy", str(qty), str(px))
+    oid = resp["order_id"]
+    d = resp
+    for _ in range(40):
+        d = gw.order(oid)
+        if d.get("status") in ("active", "complete", "canceled", "failed"):
+            break
+        time.sleep(2)
+    print(f"order {oid}: {d.get('status')} {d.get('failure_reason') or ''}")
+    if d.get("status") == "active":
+        gw.cancel(oid)
+        print("cancelled; USDC stays on the exchange")
+    time.sleep(3)
+    for r in gw.balances():
+        if r.get("symbol") in ("USDC", "PYUSD") and D(str(r.get("total") or 0)) > 0:
+            print(f"  {r['venue']:5} {r['symbol']:6} total {r.get('total')} available {r.get('available')}"
+                  f" allocated {r.get('allocated')}")
+
+
 def cmd_status(args, cfg) -> None:
     gw = _gateway("logs/status")
     rows = gw.balances()
@@ -186,6 +252,15 @@ def cmd_report(args, cfg) -> None:
         print(f"== {label}")
         for k, v in s.items():
             print(f"  {k:15} {v}")
+    # Leaderboard pace (Round 1 ends 2026-11-30 23:59 UTC).
+    goal = D(args.goal)
+    pts = led.summary(marks, 0.0)["points"]
+    end = time.mktime((2026, 11, 30, 23, 59, 0, 0, 0, 0)) - time.timezone
+    days_left = max((end - time.time()) / 86400, 0.01)
+    need = max(goal - pts, D(0))
+    print(f"== leaderboard pace\n  points so far   {pts:.0f} / goal {goal:.0f}"
+          f"\n  days left       {days_left:.1f}\n  needed per day  {need / D(str(days_left)):.0f} pts"
+          f"  (~${need / D(str(days_left)) / 3:.0f}/day of maker volume)")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -212,14 +287,23 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--side", choices=["buy", "sell"], default="buy")
     c.add_argument("--usd", default="5")
 
+    al = sub.add_parser("allocate", help="make a stock in your wallet tradeable on the exchange")
+    al.add_argument("--asset", required=True)
+    al.add_argument("--amount", default="all")
+    fu = sub.add_parser("fund", help="convert wallet stablecoins to exchange USDC in one step")
+    fu.add_argument("--usd", required=True)
+    fu.add_argument("--book", default="NVDAC")
+
     sub.add_parser("status", help="balances and open orders (read-only)")
     sub.add_parser("cancel-all", help="cancel every open CeFi order")
     rep = sub.add_parser("report", help="volume, points and PnL from the fill log")
     rep.add_argument("--live", action="store_true")
+    rep.add_argument("--goal", default="10000", help="points target for the leaderboard")
 
     args = p.parse_args(argv)
     cfg = load_config(args.config)
     {"market": cmd_market, "run": cmd_run, "status": cmd_status, "cross": cmd_cross,
+     "allocate": cmd_allocate, "fund": cmd_fund,
      "cancel-all": cmd_cancel_all, "report": cmd_report}[args.cmd](args, cfg)
 
 
