@@ -1,12 +1,14 @@
 """Quoting logic. Pure functions, no I/O, so it is easy to unit test.
 
-Idea: the competition pays 3x for maker volume and the books are thin and wide
-(~50-100 bps, 1-2 resting orders). We rest a bid and an ask *inside* the spread
-around a fair value anchored on the exchange's reference price, so:
-  * we become the best bid/ask and get filled first by any taker (maker volume, 3x),
-  * every fill is priced away from fair value, so round trips earn the spread
-    instead of paying it,
-  * inventory skews quotes so we sell what we bought and stay near flat.
+Arena scoring pays 3x for maker volume, so we rest a bid and an ask at the front of the
+queue, but never closer to fair value than `half_spread` (plus inventory skew):
+
+  * if best + 1 tick is still at least `half_spread` from fair -> improve by exactly one tick
+  * else if the best price itself is far enough from fair   -> join it
+  * else                                                     -> sit at our limit, behind
+
+Long-only spot: we only offer what we hold, and as inventory builds both quotes shift
+down so we sell back toward flat (the reducing side may go as close as `min_edge`).
 """
 
 from __future__ import annotations
@@ -27,11 +29,23 @@ class Quote:
     side: str  # "buy" | "sell"
     price: Decimal
     qty: Decimal
-    taker: bool = False  # True = intended to cross (opportunistic take)
+    taker: bool = False  # True only for taker-assist (deliberately crosses)
 
     @property
     def notional(self) -> Decimal:
         return self.price * self.qty
+
+
+@dataclass
+class Params:
+    """Per-book inputs the bot computes each loop (sizes in USD)."""
+    position_qty: Decimal = D(0)
+    usd_budget: Decimal = D(0)        # cash this book's bid may use (after buffer + other books)
+    quote_usd: Decimal = D(5)         # target size of each quote
+    book_cap_usd: Decimal = D(15)     # max inventory in this book
+    stock_room_usd: Decimal = D(30)   # remaining room under the total stock cap
+    extended: bool = False            # off-hours: wider half-spread
+    taker_budget_usd: Decimal = D(0)  # remaining daily taker-assist cost budget
 
 
 @dataclass
@@ -40,98 +54,113 @@ class Decision:
     fair: Decimal | None
     quotes: list[Quote] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    pull: bool = False             # True = don't quote this book at all right now
+    reference_stale: bool = False
 
 
-def fair_value(book: Book, reference_weight: Decimal) -> Decimal | None:
-    mid = book.mid
-    ref = book.reference
+def fair_value(book: Book, weight: Decimal) -> Decimal | None:
+    mid, ref = book.mid, book.reference
     if ref and mid:
-        return reference_weight * ref + (1 - reference_weight) * mid
-    return ref or mid
+        return weight * ref + (1 - weight) * mid
+    return mid or ref
 
 
-def decide(book: Book, cfg: Config, position_qty: Decimal, usd_available: Decimal,
-           gross_usd: Decimal, now: float | None = None) -> Decision:
-    s, z, r = cfg.strategy, cfg.sizing, cfg.risk
+def decide(book: Book, cfg: Config, p: Params, now: float | None = None) -> Decision:
+    s, r, m, ta = cfg.strategy, cfg.risk, cfg.market, cfg.taker_assist
     dec = Decision(book=book.symbol, fair=None)
 
-    if book.age_secs(now) > r.stale_data_secs:
-        dec.reasons.append(f"stale data ({book.age_secs(now):.0f}s)")
+    def pull(reason: str) -> Decision:
+        dec.pull = True
+        dec.reasons.append(reason)
         return dec
-    fair = fair_value(book, s.reference_weight)
+
+    if book.age_secs(now) > r.stale_data_secs:
+        return pull(f"our market data is stale ({book.age_secs(now):.0f}s)")
+    if not book.bid or not book.ask:
+        return pull("one-sided or empty book")
+    spread = book.spread_bps
+    if spread is not None and spread > r.max_book_spread_bps:
+        return pull(f"book too wide ({spread:.0f} bps)")
+
+    ref_stale = book.reference is None or book.reference_age_secs(now) > s.reference_stale_secs
+    dec.reference_stale = ref_stale
+    if ref_stale:
+        if spread is not None and spread > m.stale_max_spread_bps:
+            return pull(f"reference stale and book {spread:.0f} bps wide: no trustworthy fair value")
+        if book.quiet_secs(now) > m.dead_book_secs:
+            return pull("reference stale and book unchanged for a long time (market closed?)")
+    fair = fair_value(book, D(0) if ref_stale else s.reference_weight)
     dec.fair = fair
     if not fair:
-        dec.reasons.append("no fair value (empty book, no reference)")
-        return dec
-    if book.spread_bps is not None and book.spread_bps > r.max_book_spread_bps:
-        dec.reasons.append(f"book too wide ({book.spread_bps:.0f} bps)")
-        return dec
-    if book.mid and abs(fair - book.mid) / book.mid * BPS > r.max_fair_mid_gap_bps:
-        dec.reasons.append("fair value and mid disagree; sitting out")
-        return dec
+        return pull("no fair value")
+    if not ref_stale and abs(fair - book.mid) / book.mid * BPS > r.max_fair_mid_gap_bps:
+        return pull("fair value and mid disagree; sitting out")
 
+    half = s.half_spread_bps_extended if (p.extended or ref_stale) else s.half_spread_bps_regular
     tick = tick_for(fair)
-    pos_usd = position_qty * fair
-    inv = min(max(pos_usd / z.max_position_usd, D(0)), D(1)) if z.max_position_usd > 0 else D(0)
-    # Long-only spot: skew both quotes down as inventory grows (buy less eagerly, sell more eagerly),
-    # but never let the ask give up the minimum edge.
-    skew = min(inv * s.inventory_skew_bps, max(s.half_spread_bps - s.min_edge_bps, D(0)))
+    pos_usd = p.position_qty * fair
+    inv = min(max(pos_usd / p.book_cap_usd, D(0)), D(1)) if p.book_cap_usd > 0 else D(0)
+    skew = inv * s.inventory_skew_bps
+    n = s.no_cross_ticks
 
-    notional = z.quote_notional_usd
-    if cfg.book_of_the_day and book.symbol == cfg.book_of_the_day:
-        notional *= z.size_multiplier_daily_book
-
-    # ---- opportunistic take: someone is resting clearly through fair value ----
-    if s.take_enabled:
-        if book.ask and book.ask < fair * (1 - s.take_edge_bps / BPS):
-            q = qty_for_notional(min(notional, usd_available), book.ask)
-            q = min(q, round_qty(book.ask_qty, book.ask))
-            if meets_min_notional(q, book.ask):
-                dec.quotes.append(Quote("buy", book.ask, q, taker=True))
-                dec.reasons.append("take: ask below fair")
-        if book.bid and book.bid > fair * (1 + s.take_edge_bps / BPS) and position_qty > 0:
-            q = min(round_qty(position_qty, book.bid), round_qty(book.bid_qty, book.bid))
-            if meets_min_notional(q, book.bid):
-                dec.quotes.append(Quote("sell", book.bid, q, taker=True))
-                dec.reasons.append("take: bid above fair")
-        if dec.quotes:
+    # ---- taker assist (off by default): flatten inventory above the book cap ----
+    if ta.enabled and pos_usd > p.book_cap_usd and spread is not None and spread <= ta.max_spread_bps:
+        excess_qty = round_qty((pos_usd - p.book_cap_usd) / book.bid, book.bid)
+        q = min(excess_qty, round_qty(book.bid_qty, book.bid))
+        cost = q * book.bid * spread / 2 / BPS
+        if meets_min_notional(q, book.bid) and cost <= p.taker_budget_usd:
+            dec.quotes.append(Quote("sell", book.bid, q, taker=True))
+            dec.reasons.append(f"taker-assist: flatten {q} (est. cost ${cost:.4f})")
             return dec
 
     # ---- bid ----
-    bid_px = fair * (1 - (s.half_spread_bps + skew) / BPS)
-    bid_cap = fair * (1 - s.min_edge_bps / BPS)
-    if book.bid:  # no need to be more than one tick better than the current best bid
-        bid_px = min(bid_px, book.bid + tick) if book.bid < bid_cap else bid_px
-    bid_px = min(bid_px, bid_cap)
-    if book.ask:
-        bid_px = min(bid_px, book.ask - s.no_cross_ticks * tick)
-    bid_px = round_price(bid_px, "buy")
-
-    room = min(z.max_position_usd - pos_usd, z.max_gross_usd - gross_usd, usd_available)
-    bid_qty = qty_for_notional(min(notional, room), bid_px) if room > 0 and bid_px > 0 else D(0)
-    if meets_min_notional(bid_qty, bid_px):
-        dec.quotes.append(Quote("buy", bid_px, bid_qty))
+    bid_cap = fair * (1 - (half + skew) / BPS)
+    if book.bid + tick <= bid_cap:
+        bid_px = book.bid + tick          # improve by exactly one tick
+    elif book.bid <= bid_cap:
+        bid_px = book.bid                 # join
     else:
-        dec.reasons.append("no bid: position/capital limit")
+        bid_px = bid_cap                  # best is too close to fair: sit behind
+    bid_px = round_price(min(bid_px, book.ask - n * tick), "buy")
 
-    # ---- ask (only what we hold; spot cannot go short) ----
-    ask_px = fair * (1 + (s.half_spread_bps - skew) / BPS)
-    ask_floor = fair * (1 + s.min_edge_bps / BPS)
-    if book.ask:
-        ask_px = max(ask_px, book.ask - tick) if book.ask > ask_floor else ask_px
-    ask_px = max(ask_px, ask_floor)
-    if book.bid:
-        ask_px = max(ask_px, book.bid + s.no_cross_ticks * tick)
-    ask_px = round_price(ask_px, "sell")
+    room = min(p.book_cap_usd - pos_usd, p.stock_room_usd, p.usd_budget)
+    bid_qty = qty_for_notional(min(p.quote_usd, room), bid_px) if room > 0 and bid_px > 0 else D(0)
+    bid = Quote("buy", bid_px, bid_qty) if meets_min_notional(bid_qty, bid_px) else None
+    if bid is None:
+        dec.reasons.append("no bid: inventory/capital limit")
 
-    ask_qty = min(round_qty(position_qty, ask_px), qty_for_notional(notional, ask_px))
-    # If the remainder after this quote would be dust (< $1), sell it all now.
-    leftover = position_qty - ask_qty
+    # ---- ask (only what we hold) ----
+    ask_floor = fair * (1 + max(half - skew, s.min_edge_bps) / BPS)
+    if book.ask - tick >= ask_floor:
+        ask_px = book.ask - tick
+    elif book.ask >= ask_floor:
+        ask_px = book.ask
+    else:
+        ask_px = ask_floor
+    ask_px = round_price(max(ask_px, book.bid + n * tick), "sell")
+
+    ask_qty = min(round_qty(p.position_qty, ask_px), qty_for_notional(p.quote_usd, ask_px))
+    leftover = p.position_qty - ask_qty
     if leftover > 0 and not meets_min_notional(leftover, ask_px):
-        ask_qty = round_qty(position_qty, ask_px)
-    if meets_min_notional(ask_qty, ask_px):
-        dec.quotes.append(Quote("sell", ask_px, ask_qty))
-    elif position_qty > 0:
-        dec.reasons.append("no ask: holding below $1 minimum notional")
+        ask_qty = round_qty(p.position_qty, ask_px)  # don't leave sub-$1 dust behind
+    ask = Quote("sell", ask_px, ask_qty) if meets_min_notional(ask_qty, ask_px) else None
+    if ask is None and p.position_qty > 0:
+        dec.reasons.append("no ask: holding below $1 minimum")
 
+    # ---- never let our own quotes cross each other (self-trade) ----
+    if bid and ask and bid.price >= ask.price:
+        bid = None
+        dec.reasons.append("bid dropped: would cross our own ask")
+
+    dec.quotes = [q for q in (bid, ask) if q]
     return dec
+
+
+def would_cross(side: str, price: Decimal, best_bid: Decimal | None, best_ask: Decimal | None,
+                no_cross_ticks: int = 1) -> bool:
+    """True if a resting limit at `price` would trade immediately (become a taker) against the
+    given best prices, or sit closer than `no_cross_ticks` to them."""
+    tick = tick_for(price)
+    if side == "buy":
+        return best_ask is not None and price > best_ask - no_cross_ticks * tick
+    return best_bid is not None and price < best_bid + no_cross_ticks * tick
