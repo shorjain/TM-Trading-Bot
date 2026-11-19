@@ -1,20 +1,33 @@
-"""Main loop: market data -> strategy -> reconcile orders -> track fills -> risk checks."""
+"""Main loop: market data -> fills -> risk -> strategy -> prioritized order actions.
+
+The exchange processes ONE order action per account at a time, so every loop builds a
+prioritized list of actions (risk pulls first, then the book of the day, then books by
+flow) and works through it within a small time budget. Before every place/modify the
+order is re-checked against a fresh book so it can't cross (no post-only flag exists).
+"""
 
 from __future__ import annotations
 
 import collections
+import json
 import signal
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import Callable
 
+from .analytics import FlowTracker, Markouts, VolGuard
 from .client import ApiError
+from .config import Config, read_book_of_the_day
+from .executor import OPEN, LiveOrder
 from .increments import tick_for
-from .config import Config
-from .executor import LiveOrder
+from .keepawake import KeepAwake
 from .ledger import Ledger, today_start_utc
 from .market import Book, MarketFeed
-from .strategy import BPS, Decision, Quote, decide
+from .sessions import ET, now_et, session
+from .strategy import BPS, Decision, Params, Quote, decide, would_cross
 
 D = Decimal
 
@@ -34,29 +47,55 @@ class RateLimiter:
         return True
 
 
+@dataclass
+class Action:
+    priority: float           # lower runs first
+    book: str
+    kind: str                 # "cancel" | "place" | "modify"
+    side: str
+    order: LiveOrder | None = None
+    quote: Quote | None = None
+    why: str = ""
+
+
 class Bot:
     def __init__(self, cfg: Config, feed: MarketFeed, executor, ledger: Ledger, mode: str,
-                 log=print):
+                 log: Callable[[str], None] = print, lock=None, risk=None,
+                 log_dir: str | Path = "logs/paper", live: bool = False):
         self.cfg, self.feed, self.ex, self.ledger, self.mode, self.log = cfg, feed, executor, ledger, mode, log
+        self.lock, self.risk, self.live = lock, risk, live
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self.limiter = RateLimiter(cfg.risk.max_actions_per_minute)
+        self.flow = FlowTracker(cfg.flow.window_minutes)
+        self.flow.seed(ledger.fills)
+        self.vol = VolGuard(cfg.risk.vol_move_bps, cfg.risk.vol_window_secs, cfg.risk.vol_pause_secs)
+        self.markouts = Markouts(self.log_dir / "markouts.jsonl")
         self.running = True
+        self.stop_reason = ""
         self.start_ts = time.time()
         self.marks: dict[str, Decimal] = {}
+        self.books_now: dict[str, Book] = {}
         self._backoff_until = 0.0
+        self._botd_checked = 0.0
+        self._wallet_checked = 0.0
+        self._wallet0: dict | None = None
+        self.botd_from_cli = False
         self.last_decisions: dict[str, Decision] = {}
+        self.feed.set_books(cfg.all_books())
 
-    # ---- helpers ----
+    # ------------------------------------------------------------------ helpers
     def _ours(self, book: str, side: str) -> list[LiveOrder]:
-        return [o for o in self.ex.orders.values() if o.book == book and o.side == side
-                and o.status in ("active", "initialized", "pending")]
+        return [o for o in self.ex.orders.values() if o.book == book and o.side == side and o.status in OPEN]
 
-    def _gross_usd(self) -> Decimal:
-        return sum((self.ex.total_holding(b) * self.marks.get(b, D(0)) for b in self.cfg.books), D(0))
+    def _equity(self) -> tuple[Decimal, Decimal]:
+        """(equity, stock value) on the exchange, stocks marked at mid."""
+        stocks = sum((q * self.marks.get(b, D(0)) for b, q in self.ex.holdings_all().items()), D(0))
+        return self.ex.usd_total() + stocks, stocks
 
     def _without_own(self, b: Book) -> Book:
-        """The EBBO includes our own resting orders. If we are the best bid/ask, pretend the
-        level beneath us is one tick worse, so we hold our price instead of outbidding ourselves.
-        (Paper orders are not in the real book, so this only triggers live.)"""
+        """The EBBO includes our own resting orders. If ours is the best price, pretend the level
+        beneath is one tick worse, so we hold our price instead of outbidding ourselves."""
         changes = {}
         for side, attr in (("buy", "bid"), ("sell", "ask")):
             top = getattr(b, attr)
@@ -66,141 +105,328 @@ class Bot:
                     changes[attr] = top - tick if side == "buy" else top + tick
         return replace(b, **changes) if changes else b
 
-    def _act(self, what: str, fn, *args) -> bool:
-        # The gateway handles one order action per account at a time ("user already has an
-        # order in flight"). After such a conflict, back off briefly instead of piling on.
+    def stop(self, reason: str = "") -> None:
+        if reason and not self.stop_reason:
+            self.stop_reason = reason
+        self.running = False
+
+    # ------------------------------------------------------------------ book of the day
+    def _maybe_reload_botd(self) -> None:
+        if self.botd_from_cli or not self.cfg.path or time.time() - self._botd_checked < 60:
+            return
+        self._botd_checked = time.time()
+        try:
+            botd = read_book_of_the_day(self.cfg.path)
+        except Exception:
+            return
+        if botd and botd != self.cfg.book_of_the_day:
+            self.log(f"** book of the day changed in config.yaml: {self.cfg.book_of_the_day} -> {botd}")
+            if self.live and botd not in getattr(self.ex, "asset_ids", {}):
+                self.log(f"!  {botd} isn't loaded in this run; restart the bot to trade it")
+                return
+            self.cfg.book_of_the_day = botd
+            self.feed.set_books(self.cfg.all_books())
+
+    # ------------------------------------------------------------------ safety checks
+    def _check_foreign(self) -> None:
+        if not (self.live and self.lock):
+            return
+        try:
+            foreign = self.lock.foreign(self.ex.c.list_orders(status="active"))
+        except ApiError:
+            return
+        if foreign:
+            ids = ", ".join(o["order_id"][:8] for o in foreign[:5])
+            self.log(f"!! {len(foreign)} open order(s) on this account were NOT placed by this bot ({ids}...).")
+            self.log("!! Another instance (e.g. the other computer) may be trading. Stopping to avoid self-trading.")
+            self.stop("foreign orders detected")
+
+    def _check_wallet(self) -> None:
+        """Log wallet -> exchange movements the bot didn't make (it never allocates)."""
+        if not self.live or time.time() - self._wallet_checked < 300:
+            return
+        self._wallet_checked = time.time()
+        snap = self.ex.wallet_snapshot()
+        moves = []
+        if self._wallet0 is not None:
+            for k, v in snap.items():
+                v0 = self._wallet0.get(k, D(0))
+                if v < v0:
+                    moves.append({"asset": k, "wallet_before": str(v0), "wallet_now": str(v)})
+        self._wallet0 = snap
+        try:
+            allocs = self.ex.c.get("/custody/allocations").get("data", [])
+        except ApiError:
+            allocs = []
+        if self.risk is not None:
+            known = self.risk.known_allocations()
+            first_time = not known and "allocations_seen" not in self.risk.data
+            if not first_time:
+                for a in allocs:
+                    if a.get("id") not in known:
+                        moves.append({"allocation": a.get("id"), "asset": a.get("asset_symbol"),
+                                      "amount": a.get("amount"), "status": a.get("status"),
+                                      "created_at": a.get("created_at"), "failure_reason": a.get("failure_reason")})
+            self.risk.remember_allocations(a["id"] for a in allocs if a.get("id"))
+        if moves:
+            path = self.log_dir / "wallet_moves.jsonl"
+            with path.open("a") as fh:
+                for mv in moves:
+                    fh.write(json.dumps({"ts": time.time(), **mv}) + "\n")
+            self.log(f"!  wallet -> exchange movement the bot did not make: {moves[:3]}  (logged to {path})")
+
+    def _check_risk(self) -> bool:
+        if not self.risk:
+            return True
+        realized, unrealized = self.ledger.realized(), self.ledger.unrealized(self.marks)
+        reason = self.risk.check(realized, unrealized, self.cfg.risk.daily_max_loss_usd,
+                                 self.cfg.risk.round_max_loss_usd)
+        if reason:
+            self.log(f"!! {reason}. Cancelling everything and stopping.")
+            self.stop(reason)
+            return False
+        return True
+
+    # ------------------------------------------------------------------ planning
+    def _priority_books(self) -> list[str]:
+        books = self.cfg.all_books()
+        botd = self.cfg.book_of_the_day
+        rest = sorted((b for b in books if b != botd), key=lambda b: -self.flow.score(b))
+        return ([botd] if botd in books else []) + rest
+
+    def _low_flow(self, book: str) -> bool:
+        if book == self.cfg.book_of_the_day:
+            return False
+        st = self.flow.stats(book)
+        return (st["fills"] < self.cfg.flow.low_flow_fills
+                and st["market_trades_per_hour"] < self.cfg.flow.low_flow_market_trades_per_hour)
+
+    def plan(self, books: dict[str, Book], now: datetime | None = None) -> list[Action]:
+        cfg, z = self.cfg, self.cfg.sizing
+        now = now or now_et()
+        extended = session(now, cfg.pace) != "regular"
+        equity, stock_val = self._equity()
+        buffer = max(equity * z.usdc_buffer_pct, z.usdc_buffer_min_usd)
+        cash_budget = self.ex.usd_total() - buffer          # includes our current bid holds
+        stock_room = equity * z.total_stock_cap_pct - stock_val
+        taker_budget = cfg.taker_assist.daily_cost_budget_usd - (self.risk.taker_cost_today() if self.risk else D(0))
+        actions: list[Action] = []
+        for rank, sym in enumerate(self._priority_books()):
+            prio = float(rank) + 1
+            b = books.get(sym)
+            paused = b is not None and self.vol.update(sym, b.mid)
+            if b is None or paused:
+                why = "no market data" if b is None else "volatility pause"
+                for side in ("buy", "sell"):
+                    for o in self._ours(sym, side):
+                        actions.append(Action(0, sym, "cancel", side, order=o, why=why))
+                continue
+            pct = z.botd_quote_pct if sym == cfg.book_of_the_day else z.quote_pct
+            quote_usd = equity * pct
+            if extended:
+                quote_usd *= z.extended_size_mult
+            low = self._low_flow(sym)
+            if low:
+                quote_usd *= cfg.flow.low_flow_size_mult
+            p = Params(position_qty=self.ex.total_holding(sym), usd_budget=max(cash_budget, D(0)),
+                       quote_usd=quote_usd, book_cap_usd=equity * z.book_cap_pct,
+                       stock_room_usd=max(stock_room, D(0)), extended=extended,
+                       taker_budget_usd=max(taker_budget, D(0)))
+            d = decide(self._without_own(b), cfg, p)
+            self.last_decisions[sym] = d
+            want = {q.side: q for q in d.quotes}
+            if "buy" in want:
+                cash_budget -= want["buy"].notional
+            for side in ("buy", "sell"):
+                actions += self._side_actions(sym, side, want.get(side), b, prio, low, d)
+        actions.sort(key=lambda a: a.priority)
+        return actions
+
+    def _side_actions(self, book: str, side: str, want: Quote | None, raw: Book, prio: float,
+                      low_flow: bool, d: Decision) -> list[Action]:
+        live = self._ours(book, side)
+        out = [Action(0.5, book, "cancel", side, order=o, why="duplicate") for o in live[1:]]
+        cur = live[0] if live else None
+        if want is None:
+            if cur:
+                out.append(Action(0.5 if d.pull else prio, book, "cancel", side, order=cur,
+                                  why="; ".join(d.reasons) or "no quote wanted"))
+            return out
+        if cur is None:
+            out.append(Action(prio, book, "place", side, quote=want))
+            return out
+        if cur.status != "active":
+            return out  # still being accepted; can't modify yet
+        s = self.cfg.strategy
+        gap_bps = abs(cur.price - want.price) / want.price * BPS
+        moved = gap_bps > s.requote_threshold_bps
+        downsize = cur.leaves > want.qty * D("1.25")
+        upsize = cur.leaves < want.qty * D("0.6")
+        at_best = (raw.bid == cur.price) if side == "buy" else (raw.ask == cur.price)
+        # Queue priority: a modify can lose our place in line. Leave an order alone while it's
+        # at the best price and close to target, unless it must shrink (capital/inventory).
+        if at_best and gap_bps < s.queue_hold_bps and not downsize:
+            return out
+        if low_flow and time.time() - cur.last_action_at < self.cfg.flow.low_flow_refresh_secs and not downsize:
+            return out
+        if moved or downsize or upsize:
+            out.append(Action(prio + 0.1, book, "modify", side, order=cur, quote=want))
+        return out
+
+    # ------------------------------------------------------------------ execution
+    def _safe_to_send(self, a: Action) -> bool:
+        """Maker-only + no-self-trade guard against a FRESH book."""
+        q = a.quote
+        if q.taker:
+            return True
+        fresh = self.feed.fresh(a.book) or self.books_now.get(a.book)
+        if fresh is None:
+            self.log(f"  - {a.book} {a.side}: no fresh book; skipped")
+            return False
+        fb = self._without_own(fresh)
+        if would_cross(a.side, q.price, fb.bid, fb.ask, self.cfg.strategy.no_cross_ticks):
+            self.log(f"  - {a.book} {a.side} {q.price}: would cross fresh book "
+                     f"({fresh.bid}/{fresh.ask}); skipped to stay maker")
+            return False
+        opp = "sell" if a.side == "buy" else "buy"
+        for o in self._ours(a.book, opp):
+            if (a.side == "buy" and q.price >= o.price) or (a.side == "sell" and q.price <= o.price):
+                self.log(f"  - {a.book} {a.side} {q.price}: would cross our own {opp} @ {o.price}; skipped")
+                return False
+        return True
+
+    def _do(self, a: Action) -> bool:
         if time.time() < self._backoff_until:
             return False
+        if a.kind in ("place", "modify") and not self._safe_to_send(a):
+            return False
         if not self.limiter.allow():
-            self.log(f"  rate limit: skipped {what}")
+            self.log("  rate limit reached; waiting")
             return False
         try:
-            fn(*args)
+            if a.kind == "cancel":
+                self.ex.cancel(a.order)
+                self.log(f"  x {a.book:7} {a.side:4} cancel {a.order.price} ({a.why})")
+            elif a.kind == "place":
+                o = self.ex.place(a.book, a.side, a.quote.price, a.quote.qty, a.quote.taker)
+                tag = " (TAKER-ASSIST)" if a.quote.taker else ""
+                self.log(f"  + {a.book:7} {a.side:4} {o.qty} @ {o.price}{tag}")
+                if a.quote.taker and self.risk:
+                    b = self.books_now.get(a.book)
+                    if b and b.spread_bps is not None:
+                        self.risk.add_taker_cost(a.quote.notional * b.spread_bps / 2 / BPS)
+            else:
+                old = a.order.price
+                self.ex.modify(a.order, a.quote.price, a.order.executed + a.quote.qty)
+                self.log(f"  ~ {a.book:7} {a.side:4} {old} -> {a.order.price} qty {a.order.leaves}")
             return True
         except ApiError as e:
             if e.status == 409:
                 self._backoff_until = time.time() + 2.0
-                self.log(f"  . {what}: exchange busy ({e.message}); retrying shortly")
+                self.log(f"  . {a.book} {a.kind}: exchange busy ({e.message}); retrying shortly")
                 return False
-            self.log(f"  ! {what} failed: {e}")
+            if e.status == 400 and "invalid state" in (e.message or ""):
+                return False  # order changed state under us; the next loop re-reads it
+            self.log(f"  ! {a.book} {a.kind} {a.side} failed: {e}")
             if e.status in (401, 403):
-                # Retrying won't help (e.g. "trading is not available in this country").
                 self.log("!! account is not permitted to do this; stopping instead of retrying")
-                self.stop()
+                self.stop("permission denied")
             return False
 
-    # ---- reconcile one side of one book ----
-    def _reconcile_side(self, book: str, side: str, want: Quote | None) -> None:
-        live = self._ours(book, side)
-        for extra in live[1:]:  # keep at most one order per side
-            self._act(f"cancel extra {book} {side}", self.ex.cancel, extra)
-        cur = live[0] if live else None
-        if want is None:
-            if cur:
-                self._act(f"cancel {book} {side}", self.ex.cancel, cur)
-            return
-        if cur is None:
-            if self._act(f"place {book} {side} {want.qty}@{want.price}", self.ex.place, book, side,
-                         want.price, want.qty, "", want.taker):
-                self.log(f"  + {book:7} {side:4} {want.qty} @ {want.price}{' (take)' if want.taker else ''}")
-            return
-        if cur.status != "active":
-            return  # still being accepted by the exchange; can't modify yet
-        moved = abs(cur.price - want.price) / want.price * BPS > self.cfg.strategy.requote_threshold_bps
-        resized = cur.leaves > 0 and abs(cur.leaves - want.qty) / want.qty > D("0.25")
-        if moved or resized:
-            new_qty = cur.executed + want.qty
-            old_price = cur.price
-            if self._act(f"modify {book} {side}", self.ex.modify, cur, want.price, new_qty):
-                self.log(f"  ~ {book:7} {side:4} {old_price} -> {want.price} qty {want.qty}")
+    def execute(self, actions: list[Action]) -> int:
+        t0, n = time.time(), 0
+        for a in actions:
+            if not self.running or time.time() - t0 > self.cfg.loop.action_budget_secs:
+                break
+            if self._do(a):
+                n += 1
+            if time.time() < self._backoff_until:
+                break
+        return n
 
-    # ---- one iteration ----
+    # ------------------------------------------------------------------ one iteration
     def step(self, i: int) -> None:
-        books: dict[str, Book] = self.feed.snapshot()
+        self._maybe_reload_botd()
+        books = self.feed.snapshot()
+        self.books_now = books
         for sym, b in books.items():
             if b.mid:
                 self.marks[sym] = b.mid
             elif b.reference:
                 self.marks[sym] = b.reference
+            self.flow.observe_trade(sym, b.last_trade_ns)
 
         for f in self.ex.poll_fills(books):
             f.daily_book = f.book == self.cfg.book_of_the_day
             self.ledger.record(f)
-            self.log(f"  * FILL {f.book} {f.side} {f.qty} @ {f.price} {'maker' if f.maker else 'taker'}"
-                     f" (+{f.points:.2f} pts)")
+            self.flow.add_fill(f)
+            self.markouts.on_fill(f, self.marks.get(f.book))
+            self.log(f"  * FILL {f.book} {f.side} {f.qty} @ {f.price} {'maker' if f.maker else 'TAKER'}"
+                     f"{' BOTD' if f.daily_book else ''} (+{f.points:.1f} pts)")
+        self.markouts.update(self.marks)
 
-        if True:  # balances every step: cheap, and stale cash caused over-commits
-            try:
-                self.ex.refresh_balances()
-            except ApiError as e:
-                self.log(f"  ! balance refresh failed: {e}")
-
-        # Risk: hard stop on loss.
-        pnl = self.ledger.realized() + self.ledger.unrealized(self.marks)
-        if pnl < -self.cfg.risk.max_loss_usd:
-            self.log(f"!! max loss hit (pnl {pnl:.2f}); cancelling everything and stopping")
-            self.stop()
+        try:
+            self.ex.refresh_balances()
+        except ApiError as e:
+            self.log(f"  ! balance refresh failed: {e}")
             return
+        if i % 10 == 0:
+            self._check_foreign()
+        self._check_wallet()
+        if not self.running or not self._check_risk():
+            return
+        self.execute(self.plan(books))
 
-        gross = self._gross_usd()
-        # One cash budget shared by every book: total exchange USDC, which already includes
-        # what our own resting bids hold. Each book's bid is deducted before the next book
-        # decides, so the bot can never commit the same dollar twice.
-        budget = self.ex.usd_budget()
-        for sym in self.cfg.books:
-            b = books.get(sym)
-            if b is None:
-                for side in ("buy", "sell"):
-                    self._reconcile_side(sym, side, None)
-                continue
-            pos = self.ex.total_holding(sym)
-            d = decide(self._without_own(b), self.cfg, pos, max(budget, D(0)), gross)
-            self.last_decisions[sym] = d
-            want = {q.side: q for q in d.quotes}
-            if "buy" in want:
-                budget -= want["buy"].notional
-            for side in ("buy", "sell"):
-                if not self.running:
-                    return
-                self._reconcile_side(sym, side, want.get(side))
-
+    # ------------------------------------------------------------------ status / run
     def status_line(self) -> str:
         s = self.ledger.summary(self.marks, since=today_start_utc())
-        return (f"[{self.mode}] fills {s['fills']}  maker ${s['maker_volume']:.2f}  taker ${s['taker_volume']:.2f}"
-                f"  points {s['points']:.1f}  pnl r {s['realized_pnl']:+.3f} u {s['unrealized_pnl']:+.3f}"
-                f"  open orders {len(self.ex.orders)}")
+        eq, stocks = self._equity()
+        sess = session(now_et(), self.cfg.pace)
+        return (f"[{self.mode} {sess}] equity ${eq:.2f} (stocks ${stocks:.2f})  fills {s['fills']}  "
+                f"maker ${s['maker_volume']:.2f} taker ${s['taker_volume']:.2f}  pts today {s['points']:.0f}  "
+                f"pnl r {s['realized_pnl']:+.2f} u {s['unrealized_pnl']:+.2f}  open {len(self.ex.orders)}")
 
-    def stop(self) -> None:
-        self.running = False
-
-    def run(self, max_minutes: float | None = None) -> None:
-        signal.signal(signal.SIGINT, lambda *_: self.stop())
-        signal.signal(signal.SIGTERM, lambda *_: self.stop())
+    def run(self, until: datetime | None = None, max_minutes: float | None = None) -> None:
+        signal.signal(signal.SIGINT, lambda *_: self.stop("Ctrl+C"))
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: self.stop("terminated"))
+        except (ValueError, AttributeError):
+            pass
         try:
             self.ex.refresh_balances()
         except ApiError as e:
             self.log(f"! could not read balances: {e}")
-        i = 0
-        try:
-            while self.running:
-                t0 = time.time()
-                try:
-                    self.step(i)
-                except ApiError as e:
-                    self.log(f"! step error: {e}")
-                except Exception as e:  # keep running, but make it visible
-                    self.log(f"! unexpected error: {type(e).__name__}: {e}")
-                if i % 10 == 0:
-                    self.log(self.status_line())
-                i += 1
-                if max_minutes and time.time() - self.start_ts > max_minutes * 60:
-                    self.log("time limit reached")
-                    break
-                time.sleep(max(0.0, self.cfg.loop.poll_secs - (time.time() - t0)))
-        finally:
-            self.log("shutting down: cancelling all open orders")
+        i, last = 0, time.time()
+        with KeepAwake() as ka:
+            if getattr(ka, "active", False):
+                self.log("keeping this PC awake while the bot runs")
             try:
-                self.ex.cancel_all()
-            except Exception as e:
-                self.log(f"! cancel_all failed: {e}  -> run `python -m tmbot cancel-all`")
-            self.log(self.status_line())
+                while self.running:
+                    t0 = time.time()
+                    try:
+                        self.step(i)
+                    except ApiError as e:
+                        self.log(f"! step error: {e}")
+                    except Exception as e:  # keep running, but make it visible
+                        self.log(f"! unexpected error: {type(e).__name__}: {e}")
+                    if i % 20 == 0:
+                        self.log(self.status_line())
+                    i += 1
+                    if self.risk:
+                        self.risk.add_run_seconds(time.time() - last)
+                    last = time.time()
+                    if until and datetime.now(ET) >= until:
+                        self.stop(f"reached --until {until:%H:%M} ET")
+                    if max_minutes and time.time() - self.start_ts > max_minutes * 60:
+                        self.stop("time limit reached")
+                    time.sleep(max(0.0, self.cfg.loop.poll_secs - (time.time() - t0)))
+            finally:
+                self.log(f"shutting down ({self.stop_reason or 'stopped'}): cancelling this bot's open orders")
+                try:
+                    n = self.ex.cancel_own()
+                    self.log(f"cancelled {n} order(s)")
+                except Exception as e:
+                    self.log(f"! cancel failed: {e}  -> run `python -m tmbot cancel-all`")
+                if self.lock:
+                    self.lock.release()
+                self.log(self.status_line())
