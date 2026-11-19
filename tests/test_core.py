@@ -467,3 +467,40 @@ def test_taker_prefers_book_of_the_day(cfg):
     bot = Bot(cfg, fake_feed(books), PaperExecutor(D(500)), Ledger(path="/tmp/tmbot-t6.jsonl"), "t",
               log=lambda *_: None)
     assert bot.taker.candidates(books)[0] == "METAC"
+
+
+# ================= small-account floor + taker on extra books =================
+def test_min_quote_floor_keeps_small_accounts_quoting(cfg):
+    cfg.books = ["NVDAC", "METAC"]
+    cfg.book_of_the_day = "NVDAC"
+    ex = PaperExecutor(D(40))
+    books = {s: book(sym=s) for s in cfg.feed_books()}
+    bot = Bot(cfg, fake_feed(books), ex, Ledger(path="/tmp/tmbot-t7.jsonl"), "t", log=lambda *_: None)
+    acts = bot.plan(books, now=datetime(2026, 11, 19, 18, 0, tzinfo=ET))  # after hours, half size
+    placed = {}
+    for a in acts:
+        if a.kind == "place":
+            placed[a.book] = placed.get(a.book, D(0)) + a.quote.notional
+    assert placed.get("METAC", 0) >= D("4.8")       # 6% x $40 x 0.5 = $1.2 -> floored to ~$5 (lot rounding)
+    assert placed.get("NVDAC", 0) >= D("7.8")       # book of the day floor $8 (lot rounding)
+    assert "AMZNC" not in placed                     # taker-only books are not quoted
+
+
+def test_taker_trades_extra_books_and_leftovers_are_sell_only(cfg):
+    cfg.books = ["NVDAC"]
+    cfg.taker.extra_books = ["AMZNC"]
+    cfg.taker.fill_wait_secs = 0.2
+    cfg.taker.cancel_confirm_secs = 0.3
+    books = {"NVDAC": book(sym="NVDAC", bid="100.00", ask="100.30", ref="100.15"),   # too wide for taker
+             "AMZNC": book(sym="AMZNC", bid="200.00", ask="200.10", ref="200.05")}   # 5 bps
+    ex = PaperExecutor(D(500))
+    bot = Bot(cfg, fake_feed(books), ex, Ledger(path="/tmp/tmbot-t8.jsonl"), "t", log=lambda *_: None,
+              log_dir="/tmp/tmbot-t8-logs")
+    bot.books_now = books
+    assert bot.taker.candidates(books) == ["AMZNC"]
+    # a leftover AMZNC position gets a sell-only quote and blocks new AMZNC round trips
+    ex.holdings["AMZNC"] = D("0.05")
+    acts = bot.plan(books)
+    amz = [a for a in acts if a.book == "AMZNC" and a.kind == "place"]
+    assert amz and all(a.side == "sell" for a in amz)
+    assert "AMZNC" not in bot.taker.candidates(books)

@@ -153,7 +153,7 @@ def cmd_run(args, cfg) -> None:
             if input(f'Type "{CONFIRM}" to continue: ').strip() != CONFIRM:
                 lock.release()
                 sys.exit("aborted")
-        ids = _asset_ids(gw, cfg.all_books())
+        ids = _asset_ids(gw, cfg.feed_books())
         cfg.books = [b for b in cfg.books if b in ids]
         if cfg.book_of_the_day and cfg.book_of_the_day not in ids:
             log(f"!! book of the day {cfg.book_of_the_day} has no exchange listing; ignoring it")
@@ -167,10 +167,12 @@ def cmd_run(args, cfg) -> None:
         ex = PaperExecutor(usdc=D(args.paper_usdc))
     ledger = Ledger(Path(log_dir) / "fills.jsonl")
     ledger.load()
-    feed = MarketFeed(ExchangeData(env, log_dir=log_dir), cfg.all_books(), cfg.quote_asset)
+    feed = MarketFeed(ExchangeData(env, log_dir=log_dir), cfg.feed_books(), cfg.quote_asset)
     mode = f"LIVE {env}" if args.live else "PAPER"
     end = f"until {until:%a %H:%M} ET" if until else ("continuous" if args.continuous else f"{args.minutes} min")
-    log(f"starting {mode} on {', '.join(cfg.all_books())} (book of the day: {cfg.book_of_the_day or 'NOT SET'}), {end}")
+    log(f"starting {mode}: quoting {', '.join(cfg.all_books())} (book of the day: {cfg.book_of_the_day or 'NOT SET'}), {end}")
+    if cfg.taker_only_books():
+        log(f"taker round trips also on: {', '.join(cfg.taker_only_books())}")
     bot = Bot(cfg, feed, ex, ledger, mode, log=log, lock=lock, risk=risk, log_dir=log_dir, live=args.live)
     bot.botd_from_cli = bool(args.book_of_day)
     bot.run(until=until, max_minutes=args.minutes)

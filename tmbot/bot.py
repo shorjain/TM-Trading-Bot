@@ -82,7 +82,7 @@ class Bot:
         self._wallet0: dict | None = None
         self.botd_from_cli = False
         self.last_decisions: dict[str, Decision] = {}
-        self.feed.set_books(cfg.all_books())
+        self.feed.set_books(cfg.feed_books())
         from .taker import TakerEngine  # local import: taker.py depends on this module's types
         self.taker = TakerEngine(self) if cfg.taker.enabled else None
 
@@ -132,7 +132,7 @@ class Bot:
                 self.log(f"!  {botd} isn't loaded in this run; restart the bot to trade it")
                 return
             self.cfg.book_of_the_day = botd
-            self.feed.set_books(self.cfg.all_books())
+            self.feed.set_books(self.cfg.feed_books())
 
     # ------------------------------------------------------------------ safety checks
     def _check_foreign(self) -> None:
@@ -195,8 +195,12 @@ class Bot:
         return True
 
     # ------------------------------------------------------------------ planning
+    def _sell_only_books(self) -> list[str]:
+        """Taker-only books where a round trip left shares behind: quote asks until flat."""
+        return [b for b in self.cfg.taker_only_books() if self.ex.total_holding(b) > 0]
+
     def _priority_books(self) -> list[str]:
-        books = self.cfg.all_books()
+        books = self.cfg.all_books() + self._sell_only_books()
         botd = self.cfg.book_of_the_day
         rest = sorted((b for b in books if b != botd), key=lambda b: -self.flow.score(b))
         return ([botd] if botd in books else []) + rest
@@ -234,8 +238,12 @@ class Bot:
             low = self._low_flow(sym)
             if low:
                 quote_usd *= cfg.flow.low_flow_size_mult
-            layered = cfg.layers.enabled and sym not in cfg.layers.single_layer_books
-            p = Params(position_qty=self.ex.total_holding(sym), usd_budget=max(cash_budget, D(0)),
+            floor = z.min_botd_quote_usd if sym == cfg.book_of_the_day else z.min_quote_usd
+            quote_usd = max(quote_usd, floor)  # small accounts: stay above the $1 exchange minimum
+            sell_only = sym not in cfg.all_books()
+            layered = cfg.layers.enabled and sym not in cfg.layers.single_layer_books and not sell_only
+            p = Params(position_qty=self.ex.total_holding(sym),
+                       usd_budget=D(0) if sell_only else max(cash_budget, D(0)),
                        quote_usd=quote_usd, book_cap_usd=equity * z.book_cap_pct,
                        stock_room_usd=max(stock_room, D(0)), extended=extended, layered=layered)
             d = decide(self._without_own(b), cfg, p)

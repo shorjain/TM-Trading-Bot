@@ -57,20 +57,28 @@ class TakerEngine:
     def candidates(self, books: dict) -> list[str]:
         out = []
         now = time.time()
-        for sym in self.bot.cfg.all_books():
+        quoted = set(self.bot.cfg.all_books())
+        for sym in self.bot.cfg.all_books() + self.bot.cfg.taker_only_books():
             b = books.get(sym)
             d = self.bot.last_decisions.get(sym)
             if b is None or not b.bid or not b.ask or (d is not None and d.pull):
                 continue
-            if self.bot.vol.paused_until.get(sym, 0) > now:
+            # quoted books already fed their mid to the volatility guard in plan(); others feed it here
+            paused = self.bot.vol.paused_until.get(sym, 0) > now if sym in quoted else self.bot.vol.update(sym, b.mid)
+            if paused:
                 continue
-            if now - self.last_trade.get(sym, 0) < self.cfg.book_cooldown_secs:
+            if sym not in quoted and self.bot.ex.total_holding(sym) > 0:
+                continue  # leftover from a previous trip: let the sell-only quote flatten it first
+            cooldown = self.cfg.book_cooldown_secs if sym in quoted else self.cfg.extra_book_cooldown_secs
+            if now - self.last_trade.get(sym, 0) < cooldown:
                 continue
             if b.spread_bps is None or b.spread_bps > self.cfg.max_spread_bps:
                 continue
             out.append(sym)
         botd = self.bot.cfg.book_of_the_day
-        out.sort(key=lambda s_: (not (self.cfg.prefer_book_of_the_day and s_ == botd), books[s_].spread_bps))
+        # book of the day first (2x points), then books we DON'T quote (no quotes to clear), then tightest
+        out.sort(key=lambda s_: (not (self.cfg.prefer_book_of_the_day and s_ == botd), s_ in quoted,
+                                 books[s_].spread_bps))
         return out
 
     def _poll(self, sym: str) -> None:

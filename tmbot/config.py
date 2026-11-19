@@ -33,6 +33,8 @@ class SizingCfg:
     total_stock_cap_pct: Decimal = D("0.65")
     usdc_buffer_pct: Decimal = D("0.08")
     usdc_buffer_min_usd: Decimal = D(5)
+    min_quote_usd: Decimal = D(5)
+    min_botd_quote_usd: Decimal = D(8)
 
 
 @dataclass
@@ -72,6 +74,8 @@ class TakerCfg:
     min_trade_usd: Decimal = D(2)
     prefer_book_of_the_day: bool = True
     book_cooldown_secs: float = 20.0
+    extra_books: list = field(default_factory=list)
+    extra_book_cooldown_secs: float = 5.0
     fill_wait_secs: float = 2.5
     cancel_confirm_secs: float = 6.0
 
@@ -127,6 +131,16 @@ class Config:
                 out.remove(self.book_of_the_day)
             out.insert(0, self.book_of_the_day)
         return out
+
+    def taker_only_books(self) -> list[str]:
+        """Books used only for taker round trips (not quoted), when taker mode is on."""
+        if not self.taker.enabled:
+            return []
+        quoted = set(self.all_books())
+        return [str(b).upper() for b in self.taker.extra_books if str(b).upper() not in quoted]
+
+    def feed_books(self) -> list[str]:
+        return self.all_books() + self.taker_only_books()
 
 
 def _fill(dc, raw: dict | None):
