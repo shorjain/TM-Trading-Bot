@@ -1,4 +1,4 @@
-"""Load config.yaml into typed settings."""
+"""Load config.yaml into typed settings (see config.yaml for what every value means)."""
 
 from __future__ import annotations
 
@@ -13,37 +13,77 @@ D = Decimal
 
 @dataclass
 class StrategyCfg:
-    half_spread_bps: Decimal = D(20)
-    min_edge_bps: Decimal = D(8)
+    half_spread_bps_regular: Decimal = D(6)
+    half_spread_bps_extended: Decimal = D(12)
+    min_edge_bps: Decimal = D(2)
+    inventory_skew_bps: Decimal = D(10)
     no_cross_ticks: int = 1
-    inventory_skew_bps: Decimal = D(25)
-    requote_threshold_bps: Decimal = D(4)
-    reference_weight: Decimal = D("0.7")
-    take_enabled: bool = False
-    take_edge_bps: Decimal = D(60)
+    requote_threshold_bps: Decimal = D(2)
+    queue_hold_bps: Decimal = D(4)
+    reference_weight: Decimal = D("0.4")
+    reference_stale_secs: float = 180.0
 
 
 @dataclass
 class SizingCfg:
-    quote_notional_usd: Decimal = D(5)
-    size_multiplier_daily_book: Decimal = D(2)
-    max_position_usd: Decimal = D(12)
-    max_gross_usd: Decimal = D(40)
+    quote_pct: Decimal = D("0.06")
+    botd_quote_pct: Decimal = D("0.12")
+    extended_size_mult: Decimal = D("0.5")
+    book_cap_pct: Decimal = D("0.25")
+    total_stock_cap_pct: Decimal = D("0.65")
+    usdc_buffer_pct: Decimal = D("0.08")
+    usdc_buffer_min_usd: Decimal = D(5)
+
+
+@dataclass
+class FlowCfg:
+    window_minutes: float = 60.0
+    low_flow_fills: int = 2
+    low_flow_market_trades_per_hour: float = 6.0
+    low_flow_size_mult: Decimal = D("0.5")
+    low_flow_refresh_secs: float = 30.0
+
+
+@dataclass
+class MarketCfg:
+    stale_max_spread_bps: Decimal = D(60)
+    dead_book_secs: float = 1800.0
 
 
 @dataclass
 class RiskCfg:
-    max_loss_usd: Decimal = D(5)
+    daily_max_loss_usd: Decimal = D(20)
+    round_max_loss_usd: Decimal = D(150)
     max_book_spread_bps: Decimal = D(250)
     max_fair_mid_gap_bps: Decimal = D(150)
     stale_data_secs: float = 120.0
     max_actions_per_minute: int = 40
+    vol_move_bps: Decimal = D(40)
+    vol_window_secs: float = 30.0
+    vol_pause_secs: float = 120.0
+
+
+@dataclass
+class TakerAssistCfg:
+    enabled: bool = False
+    max_spread_bps: Decimal = D(8)
+    daily_cost_budget_usd: Decimal = D(2)
 
 
 @dataclass
 class LoopCfg:
     poll_secs: float = 3.0
-    reconcile_every: int = 5
+    action_budget_secs: float = 2.5
+
+
+@dataclass
+class PaceCfg:
+    goal_points: Decimal = D(60000)
+    regular: str = "09:30-16:00"
+    extended: str = "04:00-09:30,16:00-20:00"
+    include_weekends: bool = False
+    holidays: list = field(default_factory=list)
+    early_closes: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -53,39 +93,60 @@ class Config:
     quote_asset: str = "USDC"
     strategy: StrategyCfg = field(default_factory=StrategyCfg)
     sizing: SizingCfg = field(default_factory=SizingCfg)
+    flow: FlowCfg = field(default_factory=FlowCfg)
+    market: MarketCfg = field(default_factory=MarketCfg)
     risk: RiskCfg = field(default_factory=RiskCfg)
+    taker_assist: TakerAssistCfg = field(default_factory=TakerAssistCfg)
     loop: LoopCfg = field(default_factory=LoopCfg)
+    pace: PaceCfg = field(default_factory=PaceCfg)
+    path: Path | None = None
+
+    def all_books(self) -> list[str]:
+        """Configured books plus the book of the day (first, so it gets priority)."""
+        out = list(self.books)
+        if self.book_of_the_day:
+            if self.book_of_the_day in out:
+                out.remove(self.book_of_the_day)
+            out.insert(0, self.book_of_the_day)
+        return out
 
 
 def _fill(dc, raw: dict | None):
     """Copy known keys from raw into dataclass dc, coercing to the default's type."""
     for key, value in (raw or {}).items():
         if not hasattr(dc, key):
-            raise ValueError(f"unknown config key: {key}")
+            raise ValueError(f"unknown config key: {type(dc).__name__}.{key}")
         current = getattr(dc, key)
-        if isinstance(current, Decimal):
-            value = D(str(value))
-        elif isinstance(current, bool):
+        if isinstance(current, bool):
             value = bool(value)
+        elif isinstance(current, Decimal):
+            value = D(str(value))
         elif isinstance(current, int):
             value = int(value)
         elif isinstance(current, float):
             value = float(value)
+        elif isinstance(current, list):
+            value = list(value or [])
+        elif isinstance(current, dict):
+            value = dict(value or {})
         setattr(dc, key, value)
     return dc
+
+
+def read_book_of_the_day(path: str | Path) -> str | None:
+    raw = yaml.safe_load(Path(path).read_text()) or {}
+    v = raw.get("book_of_the_day")
+    return str(v).upper() if v else None
 
 
 def load_config(path: str | Path = "config.yaml") -> Config:
     raw = yaml.safe_load(Path(path).read_text()) or {}
     cfg = Config(
-        books=[b.upper() for b in raw.get("books", [])],
-        book_of_the_day=(raw.get("book_of_the_day") or None),
+        books=[str(b).upper() for b in raw.get("books", [])],
+        book_of_the_day=(str(raw["book_of_the_day"]).upper() if raw.get("book_of_the_day") else None),
         quote_asset=raw.get("quote_asset", "USDC"),
+        path=Path(path),
     )
-    if cfg.book_of_the_day:
-        cfg.book_of_the_day = cfg.book_of_the_day.upper()
-    _fill(cfg.strategy, raw.get("strategy"))
-    _fill(cfg.sizing, raw.get("sizing"))
-    _fill(cfg.risk, raw.get("risk"))
-    _fill(cfg.loop, raw.get("loop"))
+    for name in ("strategy", "sizing", "flow", "market", "risk", "taker_assist", "loop", "pace"):
+        _fill(getattr(cfg, name), raw.get(name))
     return cfg

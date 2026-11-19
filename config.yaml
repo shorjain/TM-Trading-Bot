@@ -1,75 +1,106 @@
-# TM-Trading-Bot configuration. Every value here can be overridden on the CLI.
+# TM-Trading-Bot configuration. Sized for ~$550 of exchange equity; every size is a FRACTION
+# of current equity (exchange USDC + stocks at mid), so it scales if you deposit more.
 #
-# Scoring reminder (Orderbook Arena, Round 1: Nov 2 - Nov 30 2026 UTC):
-#   points = USD volume, maker fills x3, taker fills x1, "book of the day" x2 on top.
-#   Rules: no self-trading, wallets funded from the same address = one entrant,
-#   <= 30% of your volume with any single counterparty.
+# Orderbook Arena Round 1 (ends 2026-11-30 23:59 UTC):
+#   points = 3 x maker USD volume + 1 x taker USD volume; "book of the day" x2 on top.
+#   Rules: no self-trading; <= 30% of volume with any single counterparty; one entrant.
 
-# Books to quote. Only these 12 count for the competition.
+# Books quoted every run. The book of the day is added automatically if missing.
+# NVDAC + METAC carried ~80% of volume on day 1; PLTRC is the next most active.
 books:
   - NVDAC
-  - TSLAC
-  - AAPLC
-  - MSFTC
-  - AMZNC
-  - GOOGLC
   - METAC
   - PLTRC
-  - MSTRC
-  - MUC
-  - SNDKC
-  - SPCXC
 
-# Set this every morning from the Discord announcement. Gets size_multiplier_daily_book.
+# Today's 2x book from Discord. The running bot re-reads this every minute, so you can
+# change it overnight without restarting. `--book-of-day` on the command line overrides it.
 book_of_the_day: null
 
 quote_asset: USDC
 
 strategy:
-  # Target distance of our quotes from fair value, in basis points.
-  # 2026-11-19 market hours: books are 10-20 bps wide, so 6 bps keeps us at or near
-  # the front of the queue. (Was 20; that got 0 fills in a 10-minute AAPLC test.)
-  half_spread_bps: 6
-  # Never quote tighter than this to fair (protects against adverse selection).
+  # Closest we quote to fair value, in bps (1 bp = 0.01%). Within that limit we take queue
+  # priority: improve the best price by one tick, or join it.
+  half_spread_bps_regular: 6     # 9:30-16:00 ET on trading days
+  half_spread_bps_extended: 12   # outside regular hours / when the reference price is stale
+  # Inventory skew may pull the side that REDUCES inventory down to this edge, never closer.
   min_edge_bps: 2
-  # Stay at least this many ticks behind the opposite best price, so our limit
-  # order cannot cross and become a taker (the API has no post-only flag).
+  # At max inventory, quotes shift by this many bps to sell what we hold.
+  inventory_skew_bps: 10
+  # Our buy is at least this many ticks under the live best ask (and vice versa), checked
+  # against a FRESH book right before every place/modify. The API has no post-only flag.
   no_cross_ticks: 1
-  # Shift both quotes against our inventory: at max inventory the quotes move
-  # by this many bps, so we sell what we hold more eagerly.
-  inventory_skew_bps: 25
-  # Only replace a resting quote if the new price differs by more than this.
+  # Only move a resting quote if its target moved by more than this...
   requote_threshold_bps: 2
-  # Fair value = blend of the exchange reference price and the book mid.
-  # 1.0 = reference only, 0.0 = mid only. The reference is a 30s candle and lags; AAPLC
-  # traded ~0.4% above it on 2026-11-19, so lean more on the live book.
+  # ...and never touch a quote that already sits at the best price (keeps queue priority)
+  # unless it is this many bps or more away from target.
+  queue_hold_bps: 4
+  # Fair value = w * reference + (1 - w) * mid. The reference is a ~30 s candle and lags.
   reference_weight: 0.4
-  # Taking: hit a resting quote only if it is this far through fair value (pure mispricing).
-  take_enabled: false
-  take_edge_bps: 60
+  # Reference price older than this = stale: fair uses the mid only, and the extended
+  # half-spread and size apply.
+  reference_stale_secs: 180
 
 sizing:
-  # USDC notional per quote. Exchange minimum notional is $1.
-  quote_notional_usd: 8.0
-  size_multiplier_daily_book: 2.0
-  # Max USDC worth of a single stock we will hold (long only, spot has no shorting).
-  max_position_usd: 15.0
-  # Max total USDC deployed in stock inventory across books.
-  max_gross_usd: 30.0
+  quote_pct: 0.06            # each quote = 6% of equity
+  botd_quote_pct: 0.12       # book of the day quote = 12% of equity
+  extended_size_mult: 0.5    # quote size multiplier outside regular hours
+  book_cap_pct: 0.25         # max stock held in one book, % of equity
+  total_stock_cap_pct: 0.65  # max stock held across all books, % of equity
+  usdc_buffer_pct: 0.08      # USDC never committed to orders (avoids 422 + wallet auto-funding)
+  usdc_buffer_min_usd: 5.0   # ...but at least this much
+
+flow:
+  # Rolling window for fills/hour and market trades/hour per book.
+  window_minutes: 60
+  # A book is "low flow" when, in the window, it has fewer of OUR fills than low_flow_fills
+  # AND fewer public trades/hour than low_flow_market_trades_per_hour (the book of the day
+  # never is). Both are needed, so active books aren't shrunk right after a restart.
+  low_flow_fills: 2
+  low_flow_market_trades_per_hour: 6
+  low_flow_size_mult: 0.5    # low-flow books quote smaller...
+  low_flow_refresh_secs: 30  # ...and are re-priced at most this often
+
+market:
+  # Pull quotes on a book when its best price is one-sided/empty, or when the reference is
+  # stale AND the book is wider than this (no trustworthy fair value).
+  stale_max_spread_bps: 60
+  # Pull quotes if the book has not changed at all for this long while the reference is stale.
+  dead_book_secs: 1800
 
 risk:
-  # Stop the bot (cancel all) if marked-to-market PnL falls below this.
-  max_loss_usd: 3.0
-  # Do not quote when the book is wider than this (no reliable mid).
-  max_book_spread_bps: 250
-  # Do not quote when fair value and mid disagree by more than this.
-  max_fair_mid_gap_bps: 150
-  # Ignore market data older than this.
-  stale_data_secs: 120
-  # Hard cap on order create/modify/cancel calls per minute.
+  daily_max_loss_usd: 20.0   # realized + unrealized since 00:00 ET; persisted across restarts
+  round_max_loss_usd: 150.0  # whole round; persisted across restarts
+  max_book_spread_bps: 250   # ignore books wider than this
+  max_fair_mid_gap_bps: 150  # sit out if fair value and mid disagree this much
+  stale_data_secs: 120       # our own snapshot older than this = don't quote
   max_actions_per_minute: 40
+  # Volatility pause: if a book's mid moves more than vol_move_bps within vol_window_secs,
+  # pull its quotes for vol_pause_secs.
+  vol_move_bps: 40
+  vol_window_secs: 30
+  vol_pause_secs: 120
+
+# Taker assist: crosses the spread ONLY to flatten inventory above the book cap, only on
+# tight books, within a daily cost budget. KEEP OFF until True Markets confirms deliberate
+# taker trades are within Arena rules (30% single-counterparty rule).
+taker_assist:
+  enabled: false
+  max_spread_bps: 8
+  daily_cost_budget_usd: 2.0
 
 loop:
   poll_secs: 3.0
-  # Reconcile live orders and fills against the exchange every N loops.
-  reconcile_every: 5
+  # Time budget per loop for order actions (the exchange takes one action at a time).
+  action_budget_secs: 2.5
+
+pace:
+  goal_points: 60000
+  # Hours we expect to be able to trade, ET, for the "needed per hour" figure.
+  # Regular weekday session; extended hours are on by default because trading is allowed.
+  regular: "09:30-16:00"
+  extended: "04:00-09:30,16:00-20:00"
+  include_weekends: false
+  # US market holidays / early closes in the round (no regular session / closes 13:00).
+  holidays: ["2026-11-26"]
+  early_closes: {"2026-11-27": "13:00"}
